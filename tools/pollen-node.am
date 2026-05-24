@@ -1,31 +1,140 @@
-// Pollen — UDP node daemon (Phase 1.2 minimum)
+// Pollen — UDP node daemon (Phase 1.3: JSON wire + UUID dedup)
 //
-// Binds a UDP socket, receives datagrams, echoes them back as ACK
-// to the sender. The Phase 1 wire protocol (JSON MESSAGE / ACK /
-// SYNC, UUID dedup, ACK retry, topics, subscriptions) lands in
-// 1.3 → 1.5. This first iteration just proves the node can talk
-// over the new Amalgame.Net surface (UdpSocket.ReceiveFrom +
-// ephemeral BoundPort, both shipped in amc v0.8.52).
+// Wire-compatible with TARMeule v1: parses + emits JSON envelopes:
+//
+//   MESSAGE   { "messageId": "...", "type": "MESSAGE",
+//               "topic": { "uuid": "...", "version": N },
+//               "data": <any>, "timestamp": <epoch ms> }
+//   ACK       { "type": "ACK", "messageId": "...", "timestamp": N }
+//   SYNC      { "type": "SYNCHRONIZATION", "entityType": "topic"|"souscription",
+//               "uuid": "...", "timestamp": N }
+//
+// On receive of a MESSAGE the node:
+//   1. parses the envelope
+//   2. dedups by messageId (7.5 s window — same as TARMeule)
+//   3. ACKs the sender immediately (even on duplicate — that's by
+//      design; the peer's retry stops only when it sees the ACK)
+//   4. prints a one-line summary on stdout for visibility
+//
+// ACK and SYNCHRONIZATION receives are parsed but not yet wired —
+// Phase 1.4 hooks ACK into the pendingMessages retry loop, Phase 1.5
+// makes SYNC reload topics/souscriptions from sharedDir.
 //
 // Usage:
 //   pollen-node 5000              # bind 0.0.0.0:5000
 //   pollen-node 0                 # ephemeral (port is printed)
 //
-// The daemon runs until SIGINT (Ctrl-C). For each datagram it
-// prints `recv N bytes from IP:PORT: <payload>` and sends back
-// `ACK <payload>` to the same IP:PORT. select() inside ReceiveFrom
-// uses a 1 s timeout so the loop wakes regularly — later phases
-// will use the wake to drive pending-ACK retries and the dedup
-// cache GC.
+// The ReceiveFrom timeout is 200 ms so Phase 1.4's retry / dedup
+// GC sweep can interleave without latency cost.
 
 namespace Pollen.Node
 
 import Amalgame.Net
+import Amalgame.Formats.Json
+import Amalgame.Collections
+import Amalgame.String
+
+// ── Dedup cache entry ─────────────────────────────────
+//
+// Drops a duplicate MESSAGE before dispatch but still ACKs it back
+// — that's how the peer's retry loop learns to stop. Cleanup runs
+// on every receive (cheap with a short window).
+
+public class DedupEntry {
+    public MessageId: string
+    public ExpiresAt: int       // epoch ms when this id can be evicted
+
+    public DedupEntry(string id, int expires) {
+        this.MessageId = id
+        this.ExpiresAt = expires
+    }
+}
 
 public class Program {
+
+    // TARMeule defaults — kept identical so a mixed cluster works.
+    public static int AckTimeoutMs() { return 1000 }
+    public static int MaxRetries()   { return 5 }
+    // Window = ackTimeout × maxRetries × 1.5 = 7500 ms.
+    public static int DedupWindowMs() { return 7500 }
+
+    // ── current epoch ms ──────────────────────────────
+    public static int NowMs() {
+        // Process.RunCapture("date +%s%3N") is portable enough
+        // for v0.1 — Phase 1.4 will swap to a builtin once amc
+        // ships Time_NowMs (or we use Amalgame.IO.File.Mtime
+        // semantics on /proc/uptime; trade-off documented in
+        // proposal §11). For now: shell out.
+        let r = Process.RunCapture("date +%s%3N")
+        let s: string = String_Trim(r.Stdout)
+        if (String_Length(s) == 0) { return 0 }
+        return String_ToInt(s)
+    }
+
+    // ── dedup cache helpers ───────────────────────────
+
+    public static bool DedupSeen(List<DedupEntry> cache, string id) {
+        let n: int = cache.Count()
+        for i in 0..n {
+            let e: DedupEntry = cache.Get(i)
+            if (e.MessageId == id) { return true }
+        }
+        return false
+    }
+
+    public static void DedupAdd(List<DedupEntry> cache, string id, int now) {
+        cache.Add(new DedupEntry(id, now + Program.DedupWindowMs()))
+    }
+
+    // Evict entries older than now. Single linear pass; cheap when
+    // the cache stays under a few hundred entries.
+    public static void DedupGC(List<DedupEntry> cache, int now) {
+        var i: int = 0
+        while (i < cache.Count()) {
+            let e: DedupEntry = cache.Get(i)
+            if (e.ExpiresAt <= now) {
+                cache.RemoveAt(i)
+            } else {
+                i = i + 1
+            }
+        }
+    }
+
+    // ── ACK envelope ──────────────────────────────────
+    //
+    // Build `{ "type":"ACK", "messageId":"<id>", "timestamp": N }`
+    // as a freshly-encoded JSON string. Same shape as TARMeule.
+
+    public static string EncodeAck(string messageId, int timestamp) {
+        let v = new JsonValue()
+        v.SetObject(new List<string>(), new List<JsonValue>())
+        v.AppendEntry("type",      Json.OfString("ACK"))
+        v.AppendEntry("messageId", Json.OfString(messageId))
+        v.AppendEntry("timestamp", Json.OfInt(timestamp))
+        return Json.Encode(v)
+    }
+
+    // ── topic summary for logs ────────────────────────
+
+    public static string TopicSummary(JsonValue topic) {
+        if (!topic.IsObject()) { return "?" }
+        // Two-step bind because amc's chained method-call type
+        // inference loses the JsonValue type across `.Get(...)`.
+        let uuidV:    JsonValue = topic.Get("uuid")
+        let versionV: JsonValue = topic.Get("version")
+        let uuid:    string = uuidV.AsString()
+        let version: int    = versionV.AsInt()
+        var shortId: string = uuid
+        if (String_Length(uuid) >= 8) {
+            shortId = String_Substring(uuid, 0, 8)
+        }
+        return shortId + " v" + String_FromInt(version)
+    }
+
+    // ── main loop ─────────────────────────────────────
+
     public static void Main(string[] args) {
         var port: int = 5000
-        // Args_Get(0) is the binary path; the first user arg is at 1.
         if (Args_Count() >= 2) {
             port = String_ToInt(Args_Get(1))
         }
@@ -38,25 +147,104 @@ public class Program {
         }
         let actualPort: int = sock.BoundPort
         Console.WriteLine("pollen-node: listening on UDP :{actualPort}")
+        Console.WriteLine("pollen-node: wire = TARMeule v1 (JSON), dedup window = 7500 ms")
+        // stdout is block-buffered when redirected — flush so
+        // supervisors (mosaic-style, systemd, test runners) see the
+        // startup line immediately without waiting for the 4 KB
+        // buffer to fill or for the process to exit.
+        Console.Flush()
 
-        // Receive loop — 1 s timeout per iteration so a future
-        // ACK-retry / dedup-cleanup pass can interleave cheaply.
+        let dedup: List<DedupEntry> = new List<DedupEntry>()
+
+        // Receive loop. 200 ms timeout lets Phase 1.4 retry sweep
+        // interleave without burning CPU.
         while (true) {
-            let dg = UdpSocket_ReceiveFrom(sock, 65536, 1000)
-            if (dg == null) {
+            let dg = UdpSocket_ReceiveFrom(sock, 65536, 200)
+            let now: int = Program.NowMs()
+            Program.DedupGC(dedup, now)
+
+            if (dg == null) { continue }
+
+            let payload: string = dg.Data
+            let fromIp:  string = dg.FromIp
+            let fromPort: int   = dg.FromPort
+
+            // Parse envelope. Drop malformed datagrams silently
+            // (Phase 1.x will count them via /metrics; v0.1 just
+            // prints a warning).
+            // Use JsonParser directly. The static `Json.Parse`
+            // returns JsonResult which amc's cgen mis-namespaces
+            // (Pollen_Node_JsonResult vs Amalgame_Formats_Json_…)
+            // — to be fixed in a future amc release. JsonParser's
+            // ParseTopLevel() returns a well-known JsonValue so
+            // the resolver stays happy.
+            let parser: JsonParser = new JsonParser(payload)
+            let env: JsonValue     = parser.ParseTopLevel()
+            if (parser.HasFailed()) {
+                let pmsg: string = parser.ErrorMsg()
+                Console.WriteLine("recv {dg.DataLen} bytes from {fromIp}:{fromPort} — JSON parse failed: {pmsg}")
                 continue
             }
-            let n: int     = dg.DataLen
-            let ip: string = dg.FromIp
-            let p: int     = dg.FromPort
-            let payload: string = dg.Data
-            Console.WriteLine("recv {n} bytes from {ip}:{p}: {payload}")
-
-            let ackBody: string = "ACK " + payload
-            let sent: bool = UdpSocket_Send(sock, ip, p, ackBody)
-            if (!sent) {
-                Console.WriteLine("send ACK failed to {ip}:{p}")
+            if (!env.IsObject()) {
+                Console.WriteLine("recv {dg.DataLen} bytes from {fromIp}:{fromPort} — envelope not an object")
+                continue
             }
+
+            let typeV: JsonValue = env.Get("type")
+            let mtype: string = typeV.AsString()
+
+            if (mtype == "ACK") {
+                let midV: JsonValue = env.Get("messageId")
+                let mid: string = midV.AsString()
+                Console.WriteLine("recv ACK from {fromIp}:{fromPort} for {mid}")
+                // Phase 1.4 will: remove mid from pendingMessages
+                Console.Flush()
+                continue
+            }
+
+            if (mtype == "SYNCHRONIZATION") {
+                let etV: JsonValue = env.Get("entityType")
+                let euV: JsonValue = env.Get("uuid")
+                let et: string = etV.AsString()
+                let eu: string = euV.AsString()
+                Console.WriteLine("recv SYNC from {fromIp}:{fromPort} {et}={eu}")
+                Console.Flush()
+                // Phase 1.5 will: reload the corresponding file from sharedDir
+                continue
+            }
+
+            if (mtype == "MESSAGE") {
+                let midV: JsonValue = env.Get("messageId")
+                let mid: string = midV.AsString()
+                if (String_Length(mid) == 0) {
+                    Console.WriteLine("recv MESSAGE from {fromIp}:{fromPort} — missing messageId, dropping")
+                    continue
+                }
+
+                let topicV: JsonValue = env.Get("topic")
+                let topicSum: string = Program.TopicSummary(topicV)
+
+                // Dedup: ACK either way, dispatch only on first sight.
+                let already: bool = Program.DedupSeen(dedup, mid)
+                if (already) {
+                    Console.WriteLine("recv MESSAGE dup {mid} topic={topicSum} from {fromIp}:{fromPort} — re-ACK only")
+                } else {
+                    Program.DedupAdd(dedup, mid, now)
+                    Console.WriteLine("recv MESSAGE {mid} topic={topicSum} from {fromIp}:{fromPort} bytes={dg.DataLen}")
+                    // Phase 1.5+ will dispatch to a per-topic handler here.
+                }
+
+                let ackBody: string = Program.EncodeAck(mid, now)
+                let sent: bool = UdpSocket_Send(sock, fromIp, fromPort, ackBody)
+                if (!sent) {
+                    Console.WriteLine("send ACK failed to {fromIp}:{fromPort}")
+                }
+                Console.Flush()
+                continue
+            }
+
+            Console.WriteLine("recv unknown type='{mtype}' from {fromIp}:{fromPort} — dropping")
+            Console.Flush()
         }
     }
 }
