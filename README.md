@@ -79,9 +79,11 @@ ship those.
 |---|---|---|
 | **1.2** ✅ | UDP node + ACK echo over `Amalgame.Net` | v0.1.0-dev |
 | **1.3** ✅ | JSON wire (MESSAGE / ACK / SYNC), UUID dedup window | v0.1.0-dev |
+| **1.4** ✅ | ACK retry + timeout (pollen-client, 5 attempts × 1 s) | v0.1.0-dev |
+| **1.5** ✅ | sharedDir scan at startup + SYNC reload | v0.1.0-dev |
 | **1.6** ✅ | `pollen-client` (raw + msg modes, drops `nc -u` dep) | v0.1.0-dev |
-| 1.4 | ACK retry + timeout machinery (pendingMessages) | v0.1.x |
-| 1.5 | Topics + Subscriptions persistence (JSON files) | v0.1.x |
+| 1.7 | Interop test vs TARMeule v1 Node.js node | v0.1.0 |
+| 1.8 | Release v0.1.0 (tag + packages-index entry) | v0.1.0 |
 | **2** | `workflow.json` schema + hot reload, `pollen workflow` | v0.2.0 |
 | 3 | Schema validation, QoS, multicast discovery | v0.3.0 |
 | 4 | AES-256 encryption, `/metrics` Prometheus, Mosaic bridge | v0.4.0 |
@@ -94,13 +96,28 @@ in the Amalgame repo.
 ## CLI
 
 ```
-pollen run [port]                                    Start a UDP node (default 5000; 0 = ephemeral)
-pollen send <ip> <port> <payload>                    Raw send — payload goes verbatim on the wire
+pollen run [port] [--shared <dir>]                   Start a UDP node (default port 5000; 0 = ephemeral).
+                                                     --shared loads topics + subscriptions from
+                                                     <dir>/topics/<uuid>.json and souscriptions/<uuid>.json
+                                                     at startup, and re-reads on SYNCHRONIZATION receive.
+pollen send <ip> <port> <payload>                    Raw send — payload goes verbatim on the wire.
 pollen send <ip> <port> <topic-uuid> <ver> <data>    MESSAGE envelope mode — wraps data in a
-                                                     TARMeule v1 MESSAGE, waits for ACK
-pollen version                                       Print version + amc binding info
-pollen help                                          Help
+                                                     TARMeule v1 MESSAGE, retries 5×1 s on missing ACK.
+pollen version                                       Print version + amc binding info.
+pollen help                                          Help.
 ```
+
+### sharedDir layout
+
+```
+<dir>/
+├── topics/<uuid>.json           { "uuid":"…", "name":"…", "version":N, "structure":{…} }
+└── souscriptions/<uuid>.json    { "uuid":"…", "ip":"…", "port":N, "topics":[…] }
+```
+
+Per-file storage (vs a single `topics.json`) keeps `flock(2)` granularity at the
+file level, so concurrent nodes editing different entries don't contend. SYNC
+messages broadcast which file changed, peers re-read just that one.
 
 ## Wire-compatibility with TARMeule
 
