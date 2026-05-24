@@ -92,18 +92,56 @@ cmd_run() {
 
 cmd_send() {
     if [ $# -lt 3 ]; then
-        echo "usage: pollen send <ip> <port> <payload>" >&2
+        cat >&2 <<EOF
+usage:
+    pollen send <ip> <port> <payload>
+                      Raw send — payload goes verbatim on the wire.
+    pollen send <ip> <port> <topic-uuid> <topic-version> <data-json>
+                      MESSAGE envelope mode — wraps data-json in a
+                      TARMeule v1 MESSAGE, waits for ACK by messageId,
+                      prints "ACK <mid>" or "TIMEOUT".
+EOF
         exit 2
     fi
-    local ip="$1" port="$2" payload="$3"
-    # Cheap one-shot: rely on nc (BSD or netcat-openbsd). For
-    # the moment we don't ship our own client — Phase 2 will
-    # add a pollen-client.am that uses Amalgame.Net.UdpSocket.
-    if ! command -v nc >/dev/null 2>&1; then
-        echo "pollen: 'nc' not on PATH (install ncat/netcat)" >&2
-        exit 2
+    local client="${POLLEN_CLIENT_BIN:-$HOME/.local/share/pollen/bin/pollen-client}"
+    if [ ! -x "$client" ]; then
+        # Dev mode: compile on the fly. Same plumbing as cmd_run.
+        if [ ! -f "$SCRIPT_DIR/pollen-client.am" ]; then
+            echo "pollen: cannot find pollen-client binary (POLLEN_CLIENT_BIN=$client)" >&2
+            exit 2
+        fi
+        local tmpdir
+        tmpdir="$(mktemp -d -t pollen-client-XXXXXX)"
+        trap 'rm -rf "$tmpdir"' EXIT
+        local amc_dir amc_runtime amc_stdlib
+        amc_dir="$(dirname "$(command -v amc)")"
+        if [ -d "$amc_dir/../share/amalgame/runtime" ]; then
+            amc_runtime="$amc_dir/../share/amalgame/runtime"
+            amc_stdlib="$amc_dir/../share/amalgame/stdlib"
+        else
+            amc_runtime="$amc_dir/runtime"
+            amc_stdlib="$amc_dir/src/stdlib"
+        fi
+        (cd "$tmpdir" && amc -o pollen-client "$SCRIPT_DIR/pollen-client.am" "$amc_stdlib/json.am" --quiet) \
+            || { echo "pollen: amc compile failed" >&2; exit 2; }
+        local pkg_incs=""
+        for d in "$HOME"/.amalgame/packages/github.com/amalgame-lang/*/; do
+            [ -d "$d" ] || continue
+            local latest
+            latest=$(ls -1 "$d" 2>/dev/null | sort -V | tail -1)
+            [ -n "$latest" ] && pkg_incs="$pkg_incs -I$d$latest/runtime"
+        done
+        gcc -O2 -I"$amc_runtime" $pkg_incs "$tmpdir/pollen-client.c" \
+            -lgc -lm -lz -ldl -lpthread -o "$tmpdir/pollen-client-bin" \
+            || { echo "pollen: gcc link failed" >&2; exit 2; }
+        client="$tmpdir/pollen-client-bin"
     fi
-    printf '%s' "$payload" | nc -u -w1 "$ip" "$port"
+    if [ $# -eq 3 ]; then
+        exec "$client" raw "$@"
+    else
+        # 5 args = msg mode: ip port topic-uuid topic-version data-json
+        exec "$client" msg "$@"
+    fi
 }
 
 case "${1:-help}" in

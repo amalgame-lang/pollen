@@ -24,17 +24,22 @@ Zero `@c {}` blocks, zero third-party C dependency.
 ## Quick start
 
 ```bash
-# Install (drops `pollen` + `pollen-node` into ~/.local/bin and
-# ~/.local/share/pollen/):
+# Install (drops `pollen` + `pollen-node` + `pollen-client` under
+# ~/.local/bin and ~/.local/share/pollen/):
 curl -sSL https://raw.githubusercontent.com/amalgame-lang/pollen/main/install.sh | bash
 
 # Start a node on UDP :5000
 pollen run 5000
 
-# In another shell, send a packet
-pollen send 127.0.0.1 5000 "hello pollen"
-# → node prints `recv 12 bytes from 127.0.0.1:NNNNN: hello pollen`
-# → sender receives `ACK hello pollen` back
+# In another shell, send a real TARMeule v1 MESSAGE envelope and
+# wait for its ACK:
+pollen send 127.0.0.1 5000 my-topic-uuid 1 '{"temp":25,"unit":"C"}'
+# → node prints  `recv MESSAGE <id> topic=my-topic v1 from 127.0.0.1:NNNNN ...`
+# → sender prints `ACK <id> from 127.0.0.1:5000`
+
+# Raw send (no envelope, no ACK wait — useful for SYNCHRONIZATION
+# datagrams and interop probes):
+pollen send 127.0.0.1 5000 "any-bytes-here"
 ```
 
 ## Architecture
@@ -73,8 +78,9 @@ ship those.
 | Phase | Scope | Target |
 |---|---|---|
 | **1.2** ✅ | UDP node + ACK echo over `Amalgame.Net` | v0.1.0-dev |
-| 1.3 | JSON wire (MESSAGE / ACK / SYNC), UUID dedup | v0.1.0 |
-| 1.4 | ACK retry + timeout machinery | v0.1.x |
+| **1.3** ✅ | JSON wire (MESSAGE / ACK / SYNC), UUID dedup window | v0.1.0-dev |
+| **1.6** ✅ | `pollen-client` (raw + msg modes, drops `nc -u` dep) | v0.1.0-dev |
+| 1.4 | ACK retry + timeout machinery (pendingMessages) | v0.1.x |
 | 1.5 | Topics + Subscriptions persistence (JSON files) | v0.1.x |
 | **2** | `workflow.json` schema + hot reload, `pollen workflow` | v0.2.0 |
 | 3 | Schema validation, QoS, multicast discovery | v0.3.0 |
@@ -88,10 +94,12 @@ in the Amalgame repo.
 ## CLI
 
 ```
-pollen run [port]                    Start a UDP node (default 5000; 0 = ephemeral)
-pollen send <ip> <port> <payload>    One-shot send a UDP datagram
-pollen version                       Print version + amc binding info
-pollen help                          Help
+pollen run [port]                                    Start a UDP node (default 5000; 0 = ephemeral)
+pollen send <ip> <port> <payload>                    Raw send — payload goes verbatim on the wire
+pollen send <ip> <port> <topic-uuid> <ver> <data>    MESSAGE envelope mode — wraps data in a
+                                                     TARMeule v1 MESSAGE, waits for ACK
+pollen version                                       Print version + amc binding info
+pollen help                                          Help
 ```
 
 ## Wire-compatibility with TARMeule

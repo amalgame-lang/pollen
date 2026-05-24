@@ -114,17 +114,31 @@ done
 
 gcc -O2 -I"$AMC_RUNTIME" $PKG_INCS "$BUILD_DIR/pollen-node.c" \
     -lgc -lm -lz -ldl -lpthread -o "$BUILD_DIR/pollen-node-bin" \
-    || die "gcc link failed"
+    || die "gcc link failed (pollen-node)"
+
+# Compile pollen-client (one-shot UDP send, drops nc -u dep).
+say "Compiling pollen-client…"
+(cd "$BUILD_DIR" && "$AMC" -o pollen-client \
+    "$SRC_DIR/tools/pollen-client.am" \
+    "$AMC_STDLIB/json.am" \
+    --quiet)
+[ -f "$BUILD_DIR/pollen-client.c" ] || die "amc didn't produce pollen-client.c"
+
+gcc -O2 -I"$AMC_RUNTIME" $PKG_INCS "$BUILD_DIR/pollen-client.c" \
+    -lgc -lm -lz -ldl -lpthread -o "$BUILD_DIR/pollen-client-bin" \
+    || die "gcc link failed (pollen-client)"
 
 # ── Install ────────────────────────────────────────
 mkdir -p "$BIN_DIR" "$SHARE_DIR/bin"
-cp "$BUILD_DIR/pollen-node-bin" "$SHARE_DIR/bin/pollen-node"
-cp "$SRC_DIR/tools/pollen"      "$BIN_DIR/pollen"
-chmod +x "$BIN_DIR/pollen" "$SHARE_DIR/bin/pollen-node"
+cp "$BUILD_DIR/pollen-node-bin"   "$SHARE_DIR/bin/pollen-node"
+cp "$BUILD_DIR/pollen-client-bin" "$SHARE_DIR/bin/pollen-client"
+cp "$SRC_DIR/tools/pollen"        "$BIN_DIR/pollen"
+chmod +x "$BIN_DIR/pollen" "$SHARE_DIR/bin/pollen-node" "$SHARE_DIR/bin/pollen-client"
 
 say "Installed:"
 echo "    $BIN_DIR/pollen"
 echo "    $SHARE_DIR/bin/pollen-node"
+echo "    $SHARE_DIR/bin/pollen-client"
 echo ""
 
 case ":$PATH:" in
