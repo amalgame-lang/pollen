@@ -95,6 +95,11 @@ public class Program {
         return 0
     }
 
+    // TARMeule defaults — Phase 1.4 retry parameters. Kept in
+    // sync with pollen-node.am's window so a mixed cluster works.
+    public static int AckTimeoutMs() { return 1000 }
+    public static int MaxAttempts()  { return 5 }  // initial send + 4 retries
+
     public static int RunMsg(string ip, int port, string topicUuid,
                              int topicVersion, string dataJson) {
         let sock = UdpSocket_New()
@@ -104,48 +109,57 @@ public class Program {
             return 3
         }
 
-        let mid: string  = Program.GenId()
-        let now: int     = Program.NowMs()
-        let env: string  = Program.EncodeMessage(topicUuid, topicVersion,
-                                                  dataJson, mid, now)
+        // Single messageId across all retry attempts — the
+        // receiver's dedup cache silently swallows duplicates and
+        // still ACKs them back, which is what unsticks our wait.
+        let mid: string = Program.GenId()
 
-        let okSend: bool = UdpSocket_Send(sock, ip, port, env)
-        if (!okSend) {
-            Console.WriteLine("pollen-client: send failed to {ip}:{port}")
-            UdpSocket_Close(sock)
-            return 3
+        var attempt: int = 0
+        while (attempt < Program.MaxAttempts()) {
+            attempt = attempt + 1
+            let now: int    = Program.NowMs()
+            let env: string = Program.EncodeMessage(topicUuid, topicVersion,
+                                                     dataJson, mid, now)
+            let okSend: bool = UdpSocket_Send(sock, ip, port, env)
+            if (!okSend) {
+                Console.WriteLine("pollen-client: send failed to {ip}:{port}")
+                UdpSocket_Close(sock)
+                return 3
+            }
+
+            // Poll until the per-attempt deadline. Ignore ACKs
+            // that don't match our messageId (a peer with the same
+            // socket open could be ACK'ing something else).
+            let deadline: int = now + Program.AckTimeoutMs()
+            while (true) {
+                let remaining: int = deadline - Program.NowMs()
+                if (remaining <= 0) { break }  // re-send (or give up after this loop)
+
+                let dg = UdpSocket_ReceiveFrom(sock, 65536, remaining)
+                if (dg == null) { continue }
+
+                let parser: JsonParser = new JsonParser(dg.Data)
+                let v: JsonValue       = parser.ParseTopLevel()
+                if (parser.HasFailed()) { continue }
+                let tV: JsonValue = v.Get("type")
+                let mV: JsonValue = v.Get("messageId")
+                let tS: string = tV.AsString()
+                let mS: string = mV.AsString()
+                if (tS == "ACK" && mS == mid) {
+                    Console.WriteLine("ACK {mid} from {dg.FromIp}:{dg.FromPort} (attempt {attempt})")
+                    UdpSocket_Close(sock)
+                    return 0
+                }
+            }
+            if (attempt < Program.MaxAttempts()) {
+                Console.WriteLine("pollen-client: no ACK after {attempt} attempt(s), retrying…")
+            }
         }
 
-        // Wait up to 1500 ms for an ACK whose messageId matches.
-        // Datagrams that arrive on this socket but aren't ACKs (or
-        // are ACKs for some other id) are skipped and we keep
-        // polling until the deadline.
-        let deadline: int = now + 1500
-        while (true) {
-            let remaining: int = deadline - Program.NowMs()
-            if (remaining <= 0) {
-                Console.WriteLine("pollen-client: TIMEOUT waiting for ACK {mid}")
-                UdpSocket_Close(sock)
-                return 4
-            }
-            let dg = UdpSocket_ReceiveFrom(sock, 65536, remaining)
-            if (dg == null) { continue }
-
-            let parser: JsonParser = new JsonParser(dg.Data)
-            let v: JsonValue       = parser.ParseTopLevel()
-            if (parser.HasFailed()) { continue }
-            let tV:  JsonValue = v.Get("type")
-            let mV:  JsonValue = v.Get("messageId")
-            let tS:  string = tV.AsString()
-            let mS:  string = mV.AsString()
-            if (tS == "ACK" && mS == mid) {
-                Console.WriteLine("ACK {mid} from {dg.FromIp}:{dg.FromPort}")
-                UdpSocket_Close(sock)
-                return 0
-            }
-            // otherwise: not our ACK, ignore, keep waiting
-        }
-        return 0
+        let maxA: int = Program.MaxAttempts()
+        Console.WriteLine("pollen-client: TIMEOUT after {maxA} attempts for {mid}")
+        UdpSocket_Close(sock)
+        return 4
     }
 
     // ── main ──────────────────────────────────────────
