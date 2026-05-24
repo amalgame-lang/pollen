@@ -52,17 +52,35 @@ cmd_run() {
     local port="${1:-5000}"
     local bin="${POLLEN_NODE_BIN:-$HOME/.local/share/pollen/bin/pollen-node}"
     if [ ! -x "$bin" ]; then
-        # Dev mode: fall back to the source tree's tools/ if no
-        # installed binary is around. install.sh produces the
-        # binary; without install we need to build on the fly.
+        # Dev mode: compile on the fly from the source tree's tools/.
+        # install.sh is the production path; this dev compile mirrors it
+        # (json.am extra + cached pkg -Is for the v0.8.51 cgen filter
+        # quirk that auto-injects net-http includes).
         if [ -f "$SCRIPT_DIR/pollen-node.am" ]; then
-            echo "pollen: pollen-node binary missing, compiling from source"
             local tmpdir
             tmpdir="$(mktemp -d -t pollen-XXXXXX)"
             trap 'rm -rf "$tmpdir"' EXIT
-            (cd "$tmpdir" && amc -o pollen-node "$SCRIPT_DIR/pollen-node.am" --quiet)
-            gcc -O2 -I"$(amc --runtime-dir 2>/dev/null || echo /usr/local/share/amalgame/runtime)" \
-                "$tmpdir/pollen-node.c" -lgc -lm -o "$tmpdir/pollen-node-bin"
+            local amc_dir amc_runtime amc_stdlib
+            amc_dir="$(dirname "$(command -v amc)")"
+            if [ -d "$amc_dir/../share/amalgame/runtime" ]; then
+                amc_runtime="$amc_dir/../share/amalgame/runtime"
+                amc_stdlib="$amc_dir/../share/amalgame/stdlib"
+            else
+                amc_runtime="$amc_dir/runtime"
+                amc_stdlib="$amc_dir/src/stdlib"
+            fi
+            (cd "$tmpdir" && amc -o pollen-node "$SCRIPT_DIR/pollen-node.am" "$amc_stdlib/json.am" --quiet) \
+                || { echo "pollen: amc compile failed" >&2; exit 2; }
+            local pkg_incs=""
+            for d in "$HOME"/.amalgame/packages/github.com/amalgame-lang/*/; do
+                [ -d "$d" ] || continue
+                local latest
+                latest=$(ls -1 "$d" 2>/dev/null | sort -V | tail -1)
+                [ -n "$latest" ] && pkg_incs="$pkg_incs -I$d$latest/runtime"
+            done
+            gcc -O2 -I"$amc_runtime" $pkg_incs "$tmpdir/pollen-node.c" \
+                -lgc -lm -lz -ldl -lpthread -o "$tmpdir/pollen-node-bin" \
+                || { echo "pollen: gcc link failed" >&2; exit 2; }
             bin="$tmpdir/pollen-node-bin"
         else
             echo "pollen: cannot find pollen-node binary (POLLEN_NODE_BIN=$bin)" >&2

@@ -80,20 +80,40 @@ say "Compiling pollen-node…"
 BUILD_DIR="$(mktemp -d -t pollen-build-XXXXXX)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
-(cd "$BUILD_DIR" && "$AMC" -o pollen-node "$SRC_DIR/tools/pollen-node.am" --quiet)
-[ -f "$BUILD_DIR/pollen-node.c" ] || die "amc didn't produce pollen-node.c"
-
-# Locate amc's runtime headers.
+# Locate amc's runtime + stdlib facade dirs.
 AMC_DIR="$(dirname "$AMC")"
 if [ -d "$AMC_DIR/../share/amalgame/runtime" ]; then
     AMC_RUNTIME="$AMC_DIR/../share/amalgame/runtime"
+    AMC_STDLIB="$AMC_DIR/../share/amalgame/stdlib"
 elif [ -d "$AMC_DIR/runtime" ]; then
     AMC_RUNTIME="$AMC_DIR/runtime"
+    AMC_STDLIB="$AMC_DIR/src/stdlib"
 else
     die "cannot locate amc runtime/ headers (looked next to $AMC and ../share/amalgame/)"
 fi
+[ -f "$AMC_STDLIB/json.am" ] || die "cannot locate $AMC_STDLIB/json.am (Pollen needs JSON parsing)"
 
-gcc -O2 -I"$AMC_RUNTIME" "$BUILD_DIR/pollen-node.c" -lgc -lm -o "$BUILD_DIR/pollen-node-bin" \
+# Compile pollen-node.am with json.am as an extra source so the
+# JsonParser / JsonValue / Json class methods link.
+(cd "$BUILD_DIR" && "$AMC" -o pollen-node \
+    "$SRC_DIR/tools/pollen-node.am" \
+    "$AMC_STDLIB/json.am" \
+    --quiet)
+[ -f "$BUILD_DIR/pollen-node.c" ] || die "amc didn't produce pollen-node.c"
+
+# Cached packages' runtime/ — amc auto-injects #include lines for
+# net-http into the generated .c regardless of imports (known v0.8.51
+# filter quirk, tracked in amc resolver-refactor follow-up); this
+# loop adds -I flags so gcc resolves the transitive headers.
+PKG_INCS=""
+for d in "$HOME"/.amalgame/packages/github.com/amalgame-lang/*/; do
+    [ -d "$d" ] || continue
+    latest=$(ls -1 "$d" 2>/dev/null | sort -V | tail -1)
+    [ -n "$latest" ] && PKG_INCS="$PKG_INCS -I$d$latest/runtime"
+done
+
+gcc -O2 -I"$AMC_RUNTIME" $PKG_INCS "$BUILD_DIR/pollen-node.c" \
+    -lgc -lm -lz -ldl -lpthread -o "$BUILD_DIR/pollen-node-bin" \
     || die "gcc link failed"
 
 # ── Install ────────────────────────────────────────
