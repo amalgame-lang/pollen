@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════
+#  Pollen — installer
+#  https://github.com/amalgame-lang/pollen
+#
+#  Compiles `pollen-node` from source via `amc` and drops the
+#  binary + `pollen` dispatcher into <prefix>/bin.
+#
+#  Usage:
+#    curl -sSL https://raw.githubusercontent.com/amalgame-lang/pollen/main/install.sh | bash
+#    # or, from a local clone:
+#    ./install.sh
+#
+#  Env vars:
+#    POLLEN_VERSION  Git tag to install (default: latest GitHub release;
+#                    "main" = current HEAD)
+#    POLLEN_PREFIX   Install prefix (default: $HOME/.local)
+#    AMC             Path to amc (default: looks on PATH)
+# ═══════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+REPO="amalgame-lang/pollen"
+VERSION="${POLLEN_VERSION:-latest}"
+PREFIX="${POLLEN_PREFIX:-$HOME/.local}"
+BIN_DIR="$PREFIX/bin"
+SHARE_DIR="$PREFIX/share/pollen"
+AMC="${AMC:-}"
+
+if [ -t 1 ]; then
+    GREEN='\033[0;32m'; YELLOW='\033[0;33m'; RED='\033[0;31m'; NC='\033[0m'
+else
+    GREEN=''; YELLOW=''; RED=''; NC=''
+fi
+say()  { echo -e "${GREEN}→${NC} $1"; }
+warn() { echo -e "${YELLOW}!${NC} $1" >&2; }
+die()  { echo -e "${RED}✗${NC} $1" >&2; exit 1; }
+
+# ── Locate amc ─────────────────────────────────────
+if [ -z "$AMC" ]; then
+    if command -v amc >/dev/null 2>&1; then
+        AMC="$(command -v amc)"
+    else
+        die "amc not found. Install Amalgame first: https://github.com/amalgame-lang/Amalgame"
+    fi
+fi
+AMC_VERSION=$("$AMC" --version 2>&1 | head -1 | awk '{print $2}')
+say "amc: $AMC ($AMC_VERSION)"
+
+# Sanity check: pollen requires amc v0.8.52+ for UdpSocket.ReceiveFrom.
+case "$AMC_VERSION" in
+    0.0.*|0.1.*|0.2.*|0.3.*|0.4.*|0.5.*|0.6.*|0.7.*|0.8.0|0.8.1|0.8.2|0.8.3|0.8.4|0.8.5|0.8.6|0.8.7|0.8.8|0.8.9|0.8.[1-4]?|0.8.5[0-1])
+        die "amc $AMC_VERSION too old; Pollen needs >= 0.8.52 (UdpSocket.ReceiveFrom)" ;;
+esac
+
+# ── Resolve sources ────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd 2>/dev/null || pwd)"
+SRC_DIR=""
+
+if [ -f "$SCRIPT_DIR/tools/pollen-node.am" ]; then
+    SRC_DIR="$SCRIPT_DIR"
+    say "Installing from local clone: $SRC_DIR"
+else
+    # Curl-pipe install — fetch from GitHub.
+    TMP="$(mktemp -d -t pollen-inst-XXXXXX)"
+    trap 'rm -rf "$TMP"' EXIT
+    if [ "$VERSION" = "latest" ]; then
+        VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"\(v[^"]*\)".*/\1/' || echo "main")
+        [ -z "$VERSION" ] && VERSION="main"
+    fi
+    say "Fetching $REPO@$VERSION"
+    curl -fsSL "https://github.com/$REPO/archive/$VERSION.tar.gz" \
+        | tar -xz -C "$TMP"
+    SRC_DIR=$(find "$TMP" -maxdepth 1 -mindepth 1 -type d | head -1)
+    [ -d "$SRC_DIR/tools" ] || die "downloaded archive missing tools/"
+fi
+
+# ── Compile pollen-node ────────────────────────────
+say "Compiling pollen-node…"
+BUILD_DIR="$(mktemp -d -t pollen-build-XXXXXX)"
+trap 'rm -rf "$BUILD_DIR"' EXIT
+
+(cd "$BUILD_DIR" && "$AMC" -o pollen-node "$SRC_DIR/tools/pollen-node.am" --quiet)
+[ -f "$BUILD_DIR/pollen-node.c" ] || die "amc didn't produce pollen-node.c"
+
+# Locate amc's runtime headers.
+AMC_DIR="$(dirname "$AMC")"
+if [ -d "$AMC_DIR/../share/amalgame/runtime" ]; then
+    AMC_RUNTIME="$AMC_DIR/../share/amalgame/runtime"
+elif [ -d "$AMC_DIR/runtime" ]; then
+    AMC_RUNTIME="$AMC_DIR/runtime"
+else
+    die "cannot locate amc runtime/ headers (looked next to $AMC and ../share/amalgame/)"
+fi
+
+gcc -O2 -I"$AMC_RUNTIME" "$BUILD_DIR/pollen-node.c" -lgc -lm -o "$BUILD_DIR/pollen-node-bin" \
+    || die "gcc link failed"
+
+# ── Install ────────────────────────────────────────
+mkdir -p "$BIN_DIR" "$SHARE_DIR/bin"
+cp "$BUILD_DIR/pollen-node-bin" "$SHARE_DIR/bin/pollen-node"
+cp "$SRC_DIR/tools/pollen"      "$BIN_DIR/pollen"
+chmod +x "$BIN_DIR/pollen" "$SHARE_DIR/bin/pollen-node"
+
+say "Installed:"
+echo "    $BIN_DIR/pollen"
+echo "    $SHARE_DIR/bin/pollen-node"
+echo ""
+
+case ":$PATH:" in
+    *":$BIN_DIR:"*) say "$BIN_DIR is on PATH — try \`pollen version\`" ;;
+    *) warn "$BIN_DIR is NOT on PATH. Add it to your shell rc:"
+       echo "    export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+esac
