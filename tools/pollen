@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════
+#  pollen — Pollen CLI dispatcher
+#  https://github.com/amalgame-lang/pollen
+#
+#  Subcommands:
+#    pollen run [port]          — start a UDP node (default :5000)
+#    pollen send <ip> <port> <payload>
+#                               — one-shot send a datagram, no ACK wait
+#    pollen version
+#    pollen help
+#
+#  Phase 2 will add: init / topics / subscriptions / workflow.
+# ═══════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+POLLEN_VERSION="0.1.0-dev"
+
+cmd_help() {
+    cat <<EOF
+pollen $POLLEN_VERSION — peer-to-peer UDP bus for Amalgame
+
+USAGE
+    pollen <command> [args]
+
+COMMANDS
+    run [port]                    Start a UDP node (default port: 5000)
+                                  Pass 0 for an ephemeral port (printed at startup).
+    send <ip> <port> <payload>    One-shot send a UDP datagram, no ACK wait.
+    version                       Print version + amc binding info.
+    help                          This screen.
+
+ENVIRONMENT
+    POLLEN_NODE_BIN  Path to a pre-built pollen-node binary
+                     (defaults to the one shipped by install.sh in
+                     \$HOME/.local/share/pollen/bin/pollen-node).
+EOF
+}
+
+cmd_version() {
+    echo "pollen $POLLEN_VERSION"
+    if command -v amc >/dev/null 2>&1; then
+        echo "amc: $(amc --version 2>&1 | head -1)"
+    else
+        echo "amc: not on PATH"
+    fi
+}
+
+cmd_run() {
+    local port="${1:-5000}"
+    local bin="${POLLEN_NODE_BIN:-$HOME/.local/share/pollen/bin/pollen-node}"
+    if [ ! -x "$bin" ]; then
+        # Dev mode: fall back to the source tree's tools/ if no
+        # installed binary is around. install.sh produces the
+        # binary; without install we need to build on the fly.
+        if [ -f "$SCRIPT_DIR/pollen-node.am" ]; then
+            echo "pollen: pollen-node binary missing, compiling from source"
+            local tmpdir
+            tmpdir="$(mktemp -d -t pollen-XXXXXX)"
+            trap 'rm -rf "$tmpdir"' EXIT
+            (cd "$tmpdir" && amc -o pollen-node "$SCRIPT_DIR/pollen-node.am" --quiet)
+            gcc -O2 -I"$(amc --runtime-dir 2>/dev/null || echo /usr/local/share/amalgame/runtime)" \
+                "$tmpdir/pollen-node.c" -lgc -lm -o "$tmpdir/pollen-node-bin"
+            bin="$tmpdir/pollen-node-bin"
+        else
+            echo "pollen: cannot find pollen-node binary (POLLEN_NODE_BIN=$bin)" >&2
+            exit 2
+        fi
+    fi
+    exec "$bin" "$port"
+}
+
+cmd_send() {
+    if [ $# -lt 3 ]; then
+        echo "usage: pollen send <ip> <port> <payload>" >&2
+        exit 2
+    fi
+    local ip="$1" port="$2" payload="$3"
+    # Cheap one-shot: rely on nc (BSD or netcat-openbsd). For
+    # the moment we don't ship our own client — Phase 2 will
+    # add a pollen-client.am that uses Amalgame.Net.UdpSocket.
+    if ! command -v nc >/dev/null 2>&1; then
+        echo "pollen: 'nc' not on PATH (install ncat/netcat)" >&2
+        exit 2
+    fi
+    printf '%s' "$payload" | nc -u -w1 "$ip" "$port"
+}
+
+case "${1:-help}" in
+    run)     shift; cmd_run     "$@" ;;
+    send)    shift; cmd_send    "$@" ;;
+    version) cmd_version ;;
+    help|-h|--help) cmd_help ;;
+    *)
+        echo "pollen: unknown command '$1'" >&2
+        cmd_help >&2
+        exit 2
+        ;;
+esac
