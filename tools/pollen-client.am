@@ -1,0 +1,192 @@
+// Pollen — one-shot UDP client (Phase 1.6: drop the nc -u dep)
+//
+// Sends a single UDP datagram, optionally waits for an ACK with a
+// bounded timeout. Two modes:
+//
+//   pollen-client raw <ip> <port> <payload>
+//       Send <payload> verbatim. No ACK wait. Equivalent of
+//       `printf '...' | nc -u -w0`. Useful for SYNCHRONIZATION
+//       envelopes or interop tests against a TARMeule node.
+//
+//   pollen-client msg <ip> <port> <topic-uuid> <topic-version> <data-json>
+//       Wrap <data-json> in a TARMeule v1 MESSAGE envelope:
+//           { messageId: <random>, type: "MESSAGE",
+//             topic: { uuid, version }, data: <data>,
+//             timestamp: <now ms> }
+//       Send it, wait up to 1500 ms for a matching ACK by
+//       messageId. Prints the ACK or "TIMEOUT" on failure.
+//
+// Exit codes: 0 = sent OK (and ACK received in msg mode), 2 = arg
+// error, 3 = send failed, 4 = ACK timeout (msg mode only).
+//
+// Phase 1.x will add `pollen-client probe` (discovery) and
+// per-topic schema validation. v0.2 will absorb the workflow.json
+// layer's helpers.
+
+namespace Pollen.Client
+
+import Amalgame.Net
+import Amalgame.Formats.Json
+import Amalgame.Collections
+import Amalgame.String
+
+public class Program {
+
+    // ── helpers ───────────────────────────────────────
+
+    public static int NowMs() {
+        let r = Process.RunCapture("date +%s%3N")
+        let s: string = String_Trim(r.Stdout)
+        if (String_Length(s) == 0) { return 0 }
+        return String_ToInt(s)
+    }
+
+    // Pseudo-random ID: epoch-ms + a counter-from-pid. Not RFC 4122
+    // but unique enough for Phase 1.6 to dedup correctly on the
+    // receiver side. Phase 1.x will pull a real UUIDv4 from
+    // amalgame-random once we depend on it (currently Pollen ships
+    // zero external pkg deps).
+    public static string GenId() {
+        let r = Process.RunCapture("printf '%s-%s' \"$(date +%s%N)\" \"$$\"")
+        return String_Trim(r.Stdout)
+    }
+
+    // Build the MESSAGE envelope as a JSON string.
+    public static string EncodeMessage(string topicUuid, int topicVersion,
+                                       string dataJson, string messageId,
+                                       int timestamp) {
+        // We could parse dataJson and re-encode it, but that's both
+        // expensive and a needless source of divergence vs the
+        // caller's bytes. Hand-build the envelope string so the
+        // raw bytes of `dataJson` flow through verbatim.
+        let mid: string = Json.EscapeString(messageId)
+        let tu:  string = Json.EscapeString(topicUuid)
+        let tv:  string = String_FromInt(topicVersion)
+        let ts:  string = String_FromInt(timestamp)
+        return "{\"messageId\":\"" + mid +
+               "\",\"type\":\"MESSAGE\"," +
+               "\"topic\":{\"uuid\":\"" + tu +
+               "\",\"version\":" + tv + "}," +
+               "\"data\":" + dataJson + "," +
+               "\"timestamp\":" + ts + "}"
+    }
+
+    public static void Usage() {
+        Console.WriteLine("usage:")
+        Console.WriteLine("  pollen-client raw <ip> <port> <payload>")
+        Console.WriteLine("  pollen-client msg <ip> <port> <topic-uuid> <topic-version> <data-json>")
+    }
+
+    // ── modes ─────────────────────────────────────────
+
+    public static int RunRaw(string ip, int port, string payload) {
+        let sock = UdpSocket_New()
+        let bound: bool = UdpSocket_Bind(sock, 0)
+        if (!bound) {
+            Console.WriteLine("pollen-client: failed to bind ephemeral UDP")
+            return 3
+        }
+        let ok: bool = UdpSocket_Send(sock, ip, port, payload)
+        UdpSocket_Close(sock)
+        if (!ok) {
+            Console.WriteLine("pollen-client: send failed to {ip}:{port}")
+            return 3
+        }
+        return 0
+    }
+
+    public static int RunMsg(string ip, int port, string topicUuid,
+                             int topicVersion, string dataJson) {
+        let sock = UdpSocket_New()
+        let bound: bool = UdpSocket_Bind(sock, 0)
+        if (!bound) {
+            Console.WriteLine("pollen-client: failed to bind ephemeral UDP")
+            return 3
+        }
+
+        let mid: string  = Program.GenId()
+        let now: int     = Program.NowMs()
+        let env: string  = Program.EncodeMessage(topicUuid, topicVersion,
+                                                  dataJson, mid, now)
+
+        let okSend: bool = UdpSocket_Send(sock, ip, port, env)
+        if (!okSend) {
+            Console.WriteLine("pollen-client: send failed to {ip}:{port}")
+            UdpSocket_Close(sock)
+            return 3
+        }
+
+        // Wait up to 1500 ms for an ACK whose messageId matches.
+        // Datagrams that arrive on this socket but aren't ACKs (or
+        // are ACKs for some other id) are skipped and we keep
+        // polling until the deadline.
+        let deadline: int = now + 1500
+        while (true) {
+            let remaining: int = deadline - Program.NowMs()
+            if (remaining <= 0) {
+                Console.WriteLine("pollen-client: TIMEOUT waiting for ACK {mid}")
+                UdpSocket_Close(sock)
+                return 4
+            }
+            let dg = UdpSocket_ReceiveFrom(sock, 65536, remaining)
+            if (dg == null) { continue }
+
+            let parser: JsonParser = new JsonParser(dg.Data)
+            let v: JsonValue       = parser.ParseTopLevel()
+            if (parser.HasFailed()) { continue }
+            let tV:  JsonValue = v.Get("type")
+            let mV:  JsonValue = v.Get("messageId")
+            let tS:  string = tV.AsString()
+            let mS:  string = mV.AsString()
+            if (tS == "ACK" && mS == mid) {
+                Console.WriteLine("ACK {mid} from {dg.FromIp}:{dg.FromPort}")
+                UdpSocket_Close(sock)
+                return 0
+            }
+            // otherwise: not our ACK, ignore, keep waiting
+        }
+        return 0
+    }
+
+    // ── main ──────────────────────────────────────────
+
+    public static void Main(string[] args) {
+        if (Args_Count() < 2) {
+            Program.Usage()
+            return
+        }
+        let mode: string = Args_Get(1)
+
+        if (mode == "raw") {
+            if (Args_Count() < 5) {
+                Program.Usage()
+                return
+            }
+            let ip:    string = Args_Get(2)
+            let port:  int    = String_ToInt(Args_Get(3))
+            let body:  string = Args_Get(4)
+            let rc: int = Program.RunRaw(ip, port, body)
+            Exit_Set(rc)
+            return
+        }
+
+        if (mode == "msg") {
+            if (Args_Count() < 7) {
+                Program.Usage()
+                return
+            }
+            let ip:      string = Args_Get(2)
+            let port:    int    = String_ToInt(Args_Get(3))
+            let uuid:    string = Args_Get(4)
+            let version: int    = String_ToInt(Args_Get(5))
+            let data:    string = Args_Get(6)
+            let rc: int = Program.RunMsg(ip, port, uuid, version, data)
+            Exit_Set(rc)
+            return
+        }
+
+        Console.WriteLine("pollen-client: unknown mode '{mode}'")
+        Program.Usage()
+        Exit_Set(2)
+    }
+}
