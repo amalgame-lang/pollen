@@ -180,6 +180,54 @@ recv_first_sight=$((recv_msg - recv_dup))
 # Stop receiver
 kill "$RECV_PID" 2>/dev/null; wait "$RECV_PID" 2>/dev/null
 
+# ── 5b. latency percentiles ──────────────────────────
+# Each `publish <mid> ... ts=<T0>` line (initial send) gets matched
+# to a `recv ACK ... for <mid> (publish complete) ts=<T1>` line on
+# the same publisher; latency = T1 - T0. Aggregated across all K
+# publisher logs, then sorted for percentile lookup.
+LAT_FILE="$TMP/latencies.txt"
+awk '
+    # initial publish line:
+    #   publish <mid> to <ip>:<port> topic=<uuid> v<ver> ts=<ms>
+    /^publish [^ ]+ to / && / ts=[0-9]+$/ {
+        mid = $2
+        ts  = $NF
+        sub(/^ts=/, "", ts)
+        pub[mid] = ts
+        next
+    }
+    # ACK match line:
+    #   recv ACK from <ip>:<port> for <mid> (publish complete) ts=<ms>
+    #   fields: 1=recv 2=ACK 3=from 4=<ip>:<port> 5=for 6=<mid> ...
+    /\(publish complete\) ts=[0-9]+$/ {
+        mid = $6
+        ts  = $NF
+        sub(/^ts=/, "", ts)
+        if (mid in pub) print ts - pub[mid]
+    }
+' "$TMP"/pub-*.log | sort -n > "$LAT_FILE"
+
+lat_n=$(wc -l < "$LAT_FILE" | tr -d ' ')
+if [ "$lat_n" -gt 0 ]; then
+    # percentile picker: nth = ceil(n × p / 100), 1-indexed.
+    # `function` must be at top-level in awk, not inside END.
+    lat_summary=$(awk -v n="$lat_n" '
+        function pct(p,   idx) {
+            idx = int((n * p + 99) / 100)
+            if (idx < 1) idx = 1
+            if (idx > n) idx = n
+            return a[idx]
+        }
+        { a[NR] = $1; sum += $1 }
+        END {
+            printf "min=%d p50=%d p95=%d p99=%d max=%d avg=%.1f",
+                   a[1], pct(50), pct(95), pct(99), a[n], sum/n
+        }
+    ' "$LAT_FILE")
+else
+    lat_summary="(no matched publish→ACK pairs)"
+fi
+
 # ── 6. summary ───────────────────────────────────────
 echo ""
 echo "── results ──"
@@ -195,6 +243,7 @@ if [ "$ELAPSED_MS" -gt 0 ]; then
     THROUGHPUT=$(awk "BEGIN{printf \"%.1f\", 1000.0*$total_sent/$ELAPSED_MS}")
     printf "  throughput:        %s msgs/s (publishers' wall time)\n" "$THROUGHPUT"
 fi
+printf "  latency ms (n=%d): %s\n" "$lat_n" "$lat_summary"
 echo ""
 
 # ── 7. exit code ─────────────────────────────────────
