@@ -1,0 +1,320 @@
+// Pollen — TCP node daemon (v0.2.0-dev, Phase 2.0)
+//
+// First TCP transport iteration. Replaces UDP's retry/dedup/SO_RCVBUF
+// machinery with kernel-level TCP reliability. The wire format stays
+// the same JSON envelope shape, but the architecture changes:
+//
+//   - One connection per MESSAGE (request/response style).
+//     Phase 2.1 will add long-lived connections + framing.
+//   - No app-level ACK retry (TCP retransmits).
+//   - No UUID dedup cache (TCP ordered, no in-stream duplicates).
+//   - No pendingMessages list (delivery is synchronous within a
+//     connect-send-recv-close cycle).
+//
+// Wire format per connection:
+//   client → server: <JSON envelope, MESSAGE shape>
+//   server → client: <JSON envelope, ACK shape>
+//   close
+//
+// Usage:
+//   pollen-node-tcp 5000                          # listen on :5000
+//   pollen-node-tcp 0                             # ephemeral port
+//   pollen-node-tcp 0 --publish ip:port:uuid:ver:data    # one-shot client
+//
+// The --publish flag fires a connect → send → recv-ack → close
+// cycle once at startup, then continues into the accept loop.
+// Multiple --publish flags allowed; semicolon-separated specs too.
+
+namespace Pollen.Node.Tcp
+
+import Amalgame.Net
+import Amalgame.Formats.Json
+import Amalgame.DateTime
+import Amalgame.Random
+import Amalgame.Collections
+import Amalgame.String
+
+public class Program {
+
+    // ── current epoch ms (same as UDP node) ───────────
+    public static int NowMs() {
+        let ns: int = DateTime.NowNanos()
+        return ns / 1000000
+    }
+
+    // ── UUIDv4 RFC 4122 (lifted from UDP node) ────────
+    public static string ByteHex(b: int) {
+        let digits: string = "0123456789abcdef"
+        let hi: int = (b >> 4) & 15
+        let lo: int = b & 15
+        return String_CharAt1(digits, hi) + String_CharAt1(digits, lo)
+    }
+
+    public static string UuidV4() {
+        let bytes: List<int> = Random.SystemBytes(16)
+        let b6: int = (bytes.Get(6) & 15) | 64
+        let b8: int = (bytes.Get(8) & 63) | 128
+        bytes.Set(6, b6)
+        bytes.Set(8, b8)
+        var out: string = ""
+        var i: int = 0
+        while (i < 16) {
+            if (i == 4 || i == 6 || i == 8 || i == 10) { out = out + "-" }
+            out = out + Program.ByteHex(bytes.Get(i))
+            i = i + 1
+        }
+        return out
+    }
+
+    // ── envelope builders (unchanged from UDP, kept JSON) ──
+    public static string EncodeAck(string messageId, int timestamp) {
+        let v = new JsonValue()
+        v.SetObject(new List<string>(), new List<JsonValue>())
+        v.AppendEntry("type",      Json.OfString("ACK"))
+        v.AppendEntry("messageId", Json.OfString(messageId))
+        v.AppendEntry("timestamp", Json.OfInt(timestamp))
+        return Json.Encode(v)
+    }
+
+    public static string EncodeMessage(string topicUuid, int topicVersion,
+                                       string dataJson, string messageId,
+                                       int timestamp) {
+        let mid: string = Json.EscapeString(messageId)
+        let tu:  string = Json.EscapeString(topicUuid)
+        let tv:  string = String_FromInt(topicVersion)
+        let ts:  string = String_FromInt(timestamp)
+        return "{\"messageId\":\"" + mid +
+               "\",\"type\":\"MESSAGE\"," +
+               "\"topic\":{\"uuid\":\"" + tu +
+               "\",\"version\":" + tv + "}," +
+               "\"data\":" + dataJson + "," +
+               "\"timestamp\":" + ts + "}"
+    }
+
+    public static string TopicSummary(JsonValue topic) {
+        if (!topic.IsObject()) { return "?" }
+        let uuidV:    JsonValue = topic.Get("uuid")
+        let versionV: JsonValue = topic.Get("version")
+        let uuid:    string = uuidV.AsString()
+        let version: int    = versionV.AsInt()
+        var shortId: string = uuid
+        if (String_Length(uuid) >= 8) {
+            shortId = String_Substring(uuid, 0, 8)
+        }
+        return shortId + " v" + String_FromInt(version)
+    }
+
+    // ── publish: connect, send envelope, recv ACK, close ──
+    //
+    // Returns true on ACK match, false on any failure. No retry —
+    // caller can decide to reconnect. TCP handles the kernel-level
+    // retransmission automatically up to its own timeout (~tens of
+    // seconds on Linux), which is much more conservative than our
+    // UDP 5×1s retry — but for LAN traffic the typical case is
+    // "either it connects fast or it never will" so this is fine.
+
+    public static bool PublishOne(string peerIp, int peerPort,
+                                   string topicUuid, int topicVersion,
+                                   string dataJson) {
+        let mid:  string = Program.UuidV4()
+        let now:  int    = Program.NowMs()
+        let body: string = Program.EncodeMessage(topicUuid, topicVersion,
+                                                  dataJson, mid, now)
+        Console.WriteLine("publish {mid} to {peerIp}:{peerPort} topic={topicUuid} v{topicVersion} ts={now}")
+        Console.Flush()
+
+        let cli = TcpClient_Connect(peerIp, peerPort)
+        if (!cli.Connected) {
+            Console.WriteLine("publish FAILED {mid} to {peerIp}:{peerPort} (connect refused)")
+            Console.Flush()
+            return false
+        }
+        // amc resolver mis-declares TcpClient_Send as void (the C
+        // impl returns code_bool). Can't capture the return — rely
+        // on the post-recv check below to surface a broken connect.
+        TcpClient_Send(cli, body)
+        // 32 KiB buffer for the inbound ACK — way more than our ACK
+        // envelope (under 200 bytes) but covers future extensions.
+        let respStr: string = TcpClient_Receive(cli, 32768)
+        TcpClient_Close(cli)
+        if (respStr == null) {
+            Console.WriteLine("publish FAILED {mid} to {peerIp}:{peerPort} (peer hung up before ACK)")
+            Console.Flush()
+            return false
+        }
+        let parser: JsonParser = new JsonParser(respStr)
+        let v: JsonValue       = parser.ParseTopLevel()
+        if (parser.HasFailed()) {
+            Console.WriteLine("publish FAILED {mid} to {peerIp}:{peerPort} (ACK JSON parse: {parser.ErrorMsg()})")
+            Console.Flush()
+            return false
+        }
+        let tV: JsonValue = v.Get("type")
+        let mV: JsonValue = v.Get("messageId")
+        let tS: string = tV.AsString()
+        let mS: string = mV.AsString()
+        let ackNow: int = Program.NowMs()
+        if (tS == "ACK" && mS == mid) {
+            Console.WriteLine("recv ACK from {peerIp}:{peerPort} for {mid} (publish complete) ts={ackNow}")
+            Console.Flush()
+            return true
+        }
+        Console.WriteLine("publish FAILED {mid} to {peerIp}:{peerPort} (ACK mismatch: type={tS} mid={mS})")
+        Console.Flush()
+        return false
+    }
+
+    // Server-side connection handling is inlined in Main's accept
+    // loop because amc currently mis-namespaces the built-in
+    // AmalgameTcpConn struct when it appears in an AM function
+    // signature (same family as the AmalgameUdpSocket quirk). Same
+    // workaround pattern as the UDP node.
+
+    public static void Main(string[] args) {
+        var port:        int    = 5000
+        var publishSpec: string = ""
+
+        var i: int = 1
+        while (i < Args_Count()) {
+            let a: string = Args_Get(i)
+            if (a == "--publish") {
+                if (i + 1 < Args_Count()) {
+                    if (String_Length(publishSpec) > 0) {
+                        publishSpec = publishSpec + ";" + Args_Get(i + 1)
+                    } else {
+                        publishSpec = Args_Get(i + 1)
+                    }
+                    i = i + 2
+                    continue
+                }
+                Console.WriteLine("pollen-node-tcp: --publish needs ip:port:uuid:ver:data")
+                return
+            }
+            if (port == 5000) {
+                port = String_ToInt(a)
+            }
+            i = i + 1
+        }
+
+        let server = TcpServer_Listen(port, 128)
+        if (!server.Listening) {
+            Console.WriteLine("pollen-node-tcp: failed to listen on TCP :{port}")
+            return
+        }
+        let actualPort: int = server.Port
+        if (port == 0) {
+            // TcpServer.Port reflects the requested port (0 here);
+            // the kernel-assigned ephemeral port lives on the
+            // underlying fd. The current Amalgame.Net builtin
+            // doesn't expose it via the struct, so we log what we
+            // know and warn callers using ephemeral binds that
+            // they need to read getsockname themselves (Phase 2.x
+            // will add Tcp.LocalPort the same way UdpSocket got
+            // it in amc v0.8.52).
+            Console.WriteLine("pollen-node-tcp: listening on TCP (ephemeral — port discovery deferred)")
+        } else {
+            Console.WriteLine("pollen-node-tcp: listening on TCP :{actualPort}")
+        }
+        Console.WriteLine("pollen-node-tcp: wire = JSON, transport = TCP request/response (v0.2.0-dev)")
+        Console.Flush()
+
+        // Startup-time publishes (fire-and-wait-ACK once per spec).
+        if (String_Length(publishSpec) > 0) {
+            let specs: List<string> = String_Split(publishSpec, ";")
+            let m: int = specs.Count()
+            for si in 0..m {
+                let spec: string = specs.Get(si)
+                if (String_Length(spec) == 0) { continue }
+                let parts: List<string> = String_Split(spec, ":")
+                if (parts.Count() < 5) {
+                    Console.WriteLine("pollen-node-tcp: --publish spec needs ip:port:uuid:ver:data ({spec})")
+                    continue
+                }
+                let pIp:   string = parts.Get(0)
+                let pPort: int    = String_ToInt(parts.Get(1))
+                let pUuid: string = parts.Get(2)
+                let pVer:  int    = String_ToInt(parts.Get(3))
+                var pData: string = parts.Get(4)
+                var pj: int = 5
+                while (pj < parts.Count()) {
+                    pData = pData + ":" + parts.Get(pj)
+                    pj = pj + 1
+                }
+                Program.PublishOne(pIp, pPort, pUuid, pVer, pData)
+            }
+            Console.Flush()
+        }
+
+        // Accept loop. Single-threaded for Phase 2.0 — every accept
+        // serially handled. Phase 2.1 spawns a worker thread per
+        // accept via amalgame-threading to lift the K-publisher
+        // concurrency ceiling.
+        while (true) {
+            let conn = TcpServer_Accept(server)
+            if (!conn.Connected) {
+                continue
+            }
+            let fromIp:   string = conn.RemoteIp
+            let fromPort: int    = conn.RemotePort
+            let payload:  string = TcpConn_Receive(conn, 65536)
+            if (payload == null) {
+                TcpConn_Close(conn)
+                continue
+            }
+            let plen: int = String_Length(payload)
+
+            let parser: JsonParser = new JsonParser(payload)
+            let env: JsonValue     = parser.ParseTopLevel()
+            if (parser.HasFailed()) {
+                let pmsg: string = parser.ErrorMsg()
+                Console.WriteLine("recv {plen} bytes from {fromIp}:{fromPort} — JSON parse failed: {pmsg}")
+                Console.Flush()
+                TcpConn_Close(conn)
+                continue
+            }
+            if (!env.IsObject()) {
+                Console.WriteLine("recv {plen} bytes from {fromIp}:{fromPort} — envelope not an object")
+                Console.Flush()
+                TcpConn_Close(conn)
+                continue
+            }
+            let typeV: JsonValue = env.Get("type")
+            let mtype: string = typeV.AsString()
+
+            if (mtype == "MESSAGE") {
+                let midV: JsonValue = env.Get("messageId")
+                let mid: string = midV.AsString()
+                if (String_Length(mid) == 0) {
+                    Console.WriteLine("recv MESSAGE from {fromIp}:{fromPort} — missing messageId, dropping")
+                    Console.Flush()
+                    TcpConn_Close(conn)
+                    continue
+                }
+                let topicV: JsonValue = env.Get("topic")
+                let topicSum: string = Program.TopicSummary(topicV)
+                let now: int = Program.NowMs()
+                Console.WriteLine("recv MESSAGE {mid} topic={topicSum} from {fromIp}:{fromPort} bytes={plen}")
+                let ackBody: string = Program.EncodeAck(mid, now)
+                TcpConn_Send(conn, ackBody)
+                Console.Flush()
+                TcpConn_Close(conn)
+                continue
+            }
+
+            if (mtype == "SYNCHRONIZATION") {
+                let etV: JsonValue = env.Get("entityType")
+                let euV: JsonValue = env.Get("uuid")
+                let et: string = etV.AsString()
+                let eu: string = euV.AsString()
+                Console.WriteLine("recv SYNC from {fromIp}:{fromPort} {et}={eu}")
+                Console.Flush()
+                TcpConn_Close(conn)
+                continue
+            }
+
+            Console.WriteLine("recv unknown type='{mtype}' from {fromIp}:{fromPort} — dropping")
+            Console.Flush()
+            TcpConn_Close(conn)
+        }
+    }
+}
