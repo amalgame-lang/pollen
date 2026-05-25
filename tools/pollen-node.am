@@ -412,7 +412,12 @@ public class Program {
                 let body: string = Program.EncodeMessage(pUuid, pVer, pData, mid, nowP)
                 UdpSocket_Send(sock, pIp, pPort, body)
                 pending.Add(new PendingMessage(mid, pIp, pPort, body, nowP))
-                Console.WriteLine("publish {mid} to {pIp}:{pPort} topic={pUuid} v{pVer}")
+                // ts= goes at the END so log parsers can `grep -oE
+                // 'ts=[0-9]+$'` and join with the ACK line by mid.
+                // First-attempt timestamp: this is what gives the
+                // end-to-end latency (retries log their own ts but
+                // bench computes p50/p99 from the initial send).
+                Console.WriteLine("publish {mid} to {pIp}:{pPort} topic={pUuid} v{pVer} ts={nowP}")
             }
             Console.Flush()
         }
@@ -486,9 +491,9 @@ public class Program {
                 let mid: string = midV.AsString()
                 let matched: bool = Program.PendingRemove(pending, mid)
                 if (matched) {
-                    Console.WriteLine("recv ACK from {fromIp}:{fromPort} for {mid} (publish complete)")
+                    Console.WriteLine("recv ACK from {fromIp}:{fromPort} for {mid} (publish complete) ts={now}")
                 } else {
-                    Console.WriteLine("recv ACK from {fromIp}:{fromPort} for {mid} (no pending match)")
+                    Console.WriteLine("recv ACK from {fromIp}:{fromPort} for {mid} (no pending match) ts={now}")
                 }
                 Console.Flush()
                 continue
