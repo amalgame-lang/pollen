@@ -412,6 +412,10 @@ public class Program {
     public static void Main(string[] args) {
         var port:        int    = 5000
         var publishSpec: string = ""
+        // --burst <ip:port:topic:ver:data:count> — bench fast path
+        // that bypasses the AM-side O(M) semicolon parse and calls
+        // pollen_hot_publish_stream once for the whole batch.
+        var burstSpec:   string = ""
 
         var i: int = 1
         while (i < Args_Count()) {
@@ -427,6 +431,15 @@ public class Program {
                     continue
                 }
                 Console.WriteLine("pollen-node-tcp: --publish needs ip:port:uuid:ver:data")
+                return
+            }
+            if (a == "--burst") {
+                if (i + 1 < Args_Count()) {
+                    burstSpec = Args_Get(i + 1)
+                    i = i + 2
+                    continue
+                }
+                Console.WriteLine("pollen-node-tcp: --burst needs ip:port:uuid:ver:data:count")
                 return
             }
             if (port == 5000) {
@@ -456,6 +469,36 @@ public class Program {
         }
         Console.WriteLine("pollen-node-tcp: wire = JSON\\n-delim, transport = long-lived TCP (v0.2.0-dev Phase 2.1)")
         Console.Flush()
+
+        // ── --burst fast path (Phase 2.4e) ────────────────
+        // Single split on ':' (5 fields + count), one call into the
+        // C hot path. Sidesteps the AM-side O(M) semicolon parsing
+        // that bottlenecked --publish at M ≥ 200.
+        if (String_Length(burstSpec) > 0) {
+            let parts: List<string> = String_Split(burstSpec, ":")
+            if (parts.Count() < 6) {
+                Console.WriteLine("pollen-node-tcp: --burst needs ip:port:uuid:ver:data:count")
+            } else {
+                let bIp:    string = parts.Get(0)
+                let bPort:  int    = String_ToInt(parts.Get(1))
+                let bUuid:  string = parts.Get(2)
+                let bVer:   int    = String_ToInt(parts.Get(3))
+                // Data field may itself contain colons (JSON braces).
+                // Rejoin everything between idx 4 and the last part
+                // (which is the count).
+                var bData:  string = parts.Get(4)
+                var bj: int = 5
+                while (bj < parts.Count() - 1) {
+                    bData = bData + ":" + parts.Get(bj)
+                    bj = bj + 1
+                }
+                let bCount: int = String_ToInt(parts.Get(parts.Count() - 1))
+                @c {
+                    pollen_hot_publish_stream(
+                        bIp, bPort, bUuid, bVer, bData, bCount);
+                }
+            }
+        }
 
         // Startup-time publishes. All specs that target the same
         // ip:port stream over a single TCP connection — TCP handshake
