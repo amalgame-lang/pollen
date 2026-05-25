@@ -107,7 +107,7 @@ filtering or auto-route on emit).
 | **3.2** ✅ | Auto-emit on receive: after ACKing a MESSAGE on a consumed topic, publish to every node in `next` using the local handler's output. |
 | **3.3** ✅ | Hot-reload via mtime polling watcher thread. Re-read workflow.json when its mtime changes; atomic swap under mutex. |
 | **3.4** ✅ | parentMessageId chaining: forwarded envelopes get a fresh messageId, and `,"parentMessageId":"<previous>"` is appended so any downstream node can walk back to the producer. Hot-path log distinguishes `(root)` (no parent) from `parent=<uuid>` (descendant). |
-| 3.5 | sharedDir/executions/ persistent state for the DAG (subscriptions and topic registry already shipped in Phase 1.5). |
+| **3.5** ✅ | sharedDir/executions/ persistent state. Pass `--shared-dir <path>`; each node writes one record per MESSAGE it touches under `<path>/executions/<mid>-<role>.json`. Same-mid records from emitter + consumer coexist (different `role`); chain walk reads `parentMessageId` and re-globs. |
 | 4 | Mosaic web-based workflow designer (WYSIWYG drag-and-drop, per
 the user notes). Edits workflow.json, broadcasts a SYNC packet
 to all listed nodes to trigger their reload. |
@@ -170,3 +170,46 @@ sink:    workflow: consumed topic=x.cooked msg=<B> parent=<A>
 
 (`<A>` is the producer's messageId; `<B>` is the fresh UUID the
 xformer minted when forwarding — Phase 3.4 chain visualization.)
+
+## Persistent execution state (Phase 3.5)
+
+Pass `--shared-dir <path>` to every node and they will each write
+one record per MESSAGE traversal under
+`<path>/executions/<mid>-<role>.json`:
+
+```bash
+mkdir -p /tmp/pollen-shared
+pollen-node-tcp 7902 --workflow … --node-name xformer --shared-dir /tmp/pollen-shared &
+pollen-node-tcp 7903 --workflow … --node-name sink    --shared-dir /tmp/pollen-shared &
+pollen-node-tcp 0    --publish 127.0.0.1:7902:x.raw:1:hello
+
+ls /tmp/pollen-shared/executions/
+# c760701d-…-xformer.json    ← xformer just emitted c760701d
+# c760701d-…-sink.json       ← sink just consumed c760701d
+```
+
+Each record schema:
+
+```json
+{
+  "messageId":       "<mid touched at this hop>",
+  "parentMessageId": "<incoming envelope's parent>" /* or null */,
+  "role":            "xformer",
+  "topicIn":         "x.raw",
+  "topicOut":        "x.cooked" /* "" for terminal sink */,
+  "nextCount":       1,
+  "node":            "127.0.0.1:7902",
+  "timestamp":       1779716180474
+}
+```
+
+Same-mid records from emitter + consumer coexist because the
+filename is keyed by `<mid>-<role>` — the emitter just minted that
+mid, the consumer just received it. Chain walk: read any record
+for X, follow `parentMessageId` back, repeat until null (root
+producer was an ephemeral `--publish` and has no node-side
+record).
+
+File create uses `O_CREAT|O_EXCL` so a duplicate mid (re-replay,
+shouldn't happen given fresh UUIDv4 per hop) silently skips
+rather than overwriting.

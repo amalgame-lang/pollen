@@ -120,6 +120,101 @@ import Amalgame.String
     static pthread_mutex_t _pollen_wf_mutex = PTHREAD_MUTEX_INITIALIZER;
     static int _pollen_wf_version = 0;   /* incremented on each commit */
 
+    /* Phase 3.5 — sharedDir/executions/ persistent state.
+     * Each MESSAGE traversal at this node writes one JSON file
+     * under sharedDir/executions/<mid>.json. Chains are reconstructed
+     * offline by walking parentMessageId backwards. Atomic create
+     * via O_CREAT|O_EXCL — duplicate mids (which shouldn't happen
+     * since each hop mints a fresh UUID) simply skip silently. */
+    #include <fcntl.h>
+    #include <sys/stat.h>
+    static char _pollen_shared_dir[512] = "";
+    static char _pollen_self_role[64] = "";
+    static char _pollen_self_host[64] = "127.0.0.1";
+    static int  _pollen_self_port = 0;
+
+    static void _pollen_shared_dir_set(const char* path) {
+        strncpy(_pollen_shared_dir, path, sizeof(_pollen_shared_dir) - 1);
+        _pollen_shared_dir[sizeof(_pollen_shared_dir) - 1] = '\0';
+        mkdir(_pollen_shared_dir, 0755);  /* best-effort, EEXIST ok */
+        char d[600];
+        snprintf(d, sizeof(d), "%s/executions", _pollen_shared_dir);
+        mkdir(d, 0755);
+    }
+
+    static void _pollen_self_set(const char* role, const char* host, int port) {
+        strncpy(_pollen_self_role, role, sizeof(_pollen_self_role) - 1);
+        _pollen_self_role[sizeof(_pollen_self_role) - 1] = '\0';
+        if (host && host[0]) {
+            strncpy(_pollen_self_host, host, sizeof(_pollen_self_host) - 1);
+            _pollen_self_host[sizeof(_pollen_self_host) - 1] = '\0';
+        }
+        _pollen_self_port = port;
+    }
+
+    /* Write one execution step record. All string args are length-
+     * delimited so callers can pass pointers into the recv buffer
+     * without NUL-terminating. parent_mid may be NULL (root step).
+     * topic_out may be NULL (terminal sink, no forward).
+     *
+     * Filename is <mid>-<role>.json: an emitter and a downstream
+     * sink see the same mid (the emitter just minted it, the sink
+     * just received it), so we disambiguate by role to keep both
+     * step records side-by-side. Chain walk: read X-<*>.json for
+     * any role to find parentMessageId, then repeat. */
+    static void _pollen_wf_record_step(
+            const char* mid_out, size_t mid_out_len,
+            const char* parent_mid, size_t parent_mid_len,
+            const char* topic_in, size_t topic_in_len,
+            const char* topic_out,
+            int n_nexts) {
+        if (!_pollen_shared_dir[0]) return;
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/executions/%.*s-%s.json",
+                 _pollen_shared_dir,
+                 (int) mid_out_len, mid_out,
+                 _pollen_self_role[0] ? _pollen_self_role : "node");
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd < 0) return;  /* dup or fs error: best-effort, skip */
+        char buf[1024];
+        int64_t now = _pollen_now_ms_c();
+        int n;
+        if (parent_mid && parent_mid_len > 0) {
+            n = snprintf(buf, sizeof(buf),
+                "{\"messageId\":\"%.*s\","
+                "\"parentMessageId\":\"%.*s\","
+                "\"role\":\"%s\",\"topicIn\":\"%.*s\","
+                "\"topicOut\":\"%s\",\"nextCount\":%d,"
+                "\"node\":\"%s:%d\",\"timestamp\":%lld}\n",
+                (int) mid_out_len, mid_out,
+                (int) parent_mid_len, parent_mid,
+                _pollen_self_role,
+                (int) topic_in_len, topic_in,
+                topic_out ? topic_out : "",
+                n_nexts,
+                _pollen_self_host, _pollen_self_port,
+                (long long) now);
+        } else {
+            n = snprintf(buf, sizeof(buf),
+                "{\"messageId\":\"%.*s\","
+                "\"parentMessageId\":null,"
+                "\"role\":\"%s\",\"topicIn\":\"%.*s\","
+                "\"topicOut\":\"%s\",\"nextCount\":%d,"
+                "\"node\":\"%s:%d\",\"timestamp\":%lld}\n",
+                (int) mid_out_len, mid_out,
+                _pollen_self_role,
+                (int) topic_in_len, topic_in,
+                topic_out ? topic_out : "",
+                n_nexts,
+                _pollen_self_host, _pollen_self_port,
+                (long long) now);
+        }
+        if (n > 0 && n < (int) sizeof(buf)) {
+            write(fd, buf, (size_t) n);
+        }
+        close(fd);
+    }
+
     static void _pollen_wf_add_consume(const char* topic) {
         if (_pollen_wf_n_consumes >= POLLEN_MAX_CONSUMES) return;
         strncpy(_pollen_wf_consumes[_pollen_wf_n_consumes], topic,
@@ -250,7 +345,8 @@ import Amalgame.String
     static size_t _pollen_wf_rebuild_envelope(
             const char* in, size_t in_len,
             char* out, size_t out_cap,
-            const char* new_topic) {
+            const char* new_topic,
+            char* out_new_mid /* may be NULL; 37-byte buf */) {
         const char* m_key = _pollen_find(in, in_len, "\"messageId\":\"", 13);
         if (!m_key) return 0;
         const char* old_mid = m_key + 13;
@@ -280,6 +376,7 @@ import Amalgame.String
 
         char new_mid[37];
         _pollen_gen_uuid(new_mid);
+        if (out_new_mid) memcpy(out_new_mid, new_mid, 37);
 
         /* Emit piecewise into out[] with bounds checks. */
         size_t o = 0;
@@ -350,7 +447,8 @@ import Amalgame.String
         return total;
     }
 
-    static void _pollen_wf_forward_all(const char* envelope, size_t env_len) {
+    static void _pollen_wf_forward_all(const char* envelope, size_t env_len,
+                                        char* out_new_mid /* may be NULL */) {
         /* Phase 3.4: always rebuild with fresh messageId +
          * parentMessageId chain. Topic is rewritten too if the
          * node declared an emits[0]. Failure to rebuild (oversize
@@ -363,8 +461,9 @@ import Amalgame.String
                                 _pollen_wf_emit_topic : NULL;
         size_t rn = _pollen_wf_rebuild_envelope(envelope, env_len,
                                                  rebuilt, sizeof(rebuilt),
-                                                 new_topic);
+                                                 new_topic, out_new_mid);
         if (rn > 0) { fwd = rebuilt; fwd_len = rn; }
+        else if (out_new_mid) { out_new_mid[0] = '\0'; }
         for (int i = 0; i < _pollen_wf_n_nexts; i++) {
             _pollen_wf_forward_one(_pollen_wf_next_host[i],
                                    _pollen_wf_next_port[i],
@@ -623,8 +722,10 @@ import Amalgame.String
                                     parent_len = (size_t)(pq - parent_start);
                                 }
                             }
+                            char fwd_new_mid[37] = {0};
                             if (_pollen_wf_n_nexts > 0) {
-                                _pollen_wf_forward_all(rbuf, line_len);
+                                _pollen_wf_forward_all(rbuf, line_len,
+                                                       fwd_new_mid);
                                 if (parent_start) {
                                     fprintf(stdout,
                                         "workflow: consumed topic=%.*s "
@@ -647,6 +748,18 @@ import Amalgame.String
                                         _pollen_wf_n_nexts,
                                         _pollen_wf_emit_topic[0] ? _pollen_wf_emit_topic : "(verbatim)");
                                 }
+                                /* Phase 3.5 — record the step with
+                                 * the new mid that downstream nodes
+                                 * will see (parent = incoming mid). */
+                                if (fwd_new_mid[0]) {
+                                    _pollen_wf_record_step(
+                                        fwd_new_mid, 36,
+                                        mp, midlen,
+                                        topic_start, topic_len,
+                                        _pollen_wf_emit_topic[0] ?
+                                            _pollen_wf_emit_topic : NULL,
+                                        _pollen_wf_n_nexts);
+                                }
                             } else {
                                 if (parent_start) {
                                     fprintf(stdout,
@@ -664,6 +777,15 @@ import Amalgame.String
                                         (int) topic_len, topic_start,
                                         (int) midlen, mp);
                                 }
+                                /* Phase 3.5 — terminal sink: record
+                                 * the leaf step with own mid + parent
+                                 * from the incoming envelope. */
+                                _pollen_wf_record_step(
+                                    mp, midlen,
+                                    parent_start, parent_len,
+                                    topic_start, topic_len,
+                                    NULL,
+                                    0);
                             }
                             fflush(stdout);
                         }
@@ -967,6 +1089,10 @@ public class Program {
         // deferred to Phase 3.1+; the hot path stays unchanged.
         var workflowPath: string = ""
         var nodeName:     string = ""
+        // --shared-dir <path> — Phase 3.5 persistent execution
+        // records. When set, each MESSAGE traversal at this node
+        // writes <path>/executions/<mid>.json.
+        var sharedDir:    string = ""
 
         var i: int = 1
         while (i < Args_Count()) {
@@ -1011,6 +1137,15 @@ public class Program {
                 Console.WriteLine("pollen-node-tcp: --node-name needs a role name")
                 return
             }
+            if (a == "--shared-dir") {
+                if (i + 1 < Args_Count()) {
+                    sharedDir = Args_Get(i + 1)
+                    i = i + 2
+                    continue
+                }
+                Console.WriteLine("pollen-node-tcp: --shared-dir needs a directory path")
+                return
+            }
             if (port == 5000) {
                 port = String_ToInt(a)
             }
@@ -1038,6 +1173,22 @@ public class Program {
         }
         Console.WriteLine("pollen-node-tcp: wire = JSON\\n-delim, transport = long-lived TCP (v0.2.0-dev Phase 2.1)")
         Console.Flush()
+
+        // ── Phase 3.5: configure shared-dir + self identity ──
+        // The C-side recorder needs role + host:port to stamp each
+        // step file. Role here is the CLI --node-name (resolved to
+        // the workflow's actual key inside LoadWorkflow if needed,
+        // but for the recorder the operator-supplied name is the
+        // right human label). Host defaults to 127.0.0.1 — Phase 3.x
+        // will read the workflow.json host for this role.
+        if (String_Length(sharedDir) > 0) {
+            @c { _pollen_shared_dir_set(sharedDir); }
+            Console.WriteLine("pollen-node-tcp: sharedDir = {sharedDir} (executions/ recorder armed)")
+            Console.Flush()
+        }
+        let selfRole: string = nodeName
+        let selfHost: string = "127.0.0.1"
+        @c { _pollen_self_set(selfRole, selfHost, (int) actualPort); }
 
         // ── Phase 3.0: workflow.json self-identification ──
         //   Phase 3.3 hot-reload: after the initial load, spawn a
