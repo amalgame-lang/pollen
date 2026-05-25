@@ -68,14 +68,17 @@ public class PendingMessage {
     public PeerPort:  int
     public Body:      string    // pre-encoded JSON envelope, reused on retry
     public SentAtMs:  int       // when the LAST attempt fired
+    public DueAtMs:   int       // next retry deadline (jittered, set per send)
     public Attempts:  int       // 1 = initial send; retries grow this
 
-    public PendingMessage(string id, string ip, int port, string body, int sentAt) {
+    public PendingMessage(string id, string ip, int port, string body,
+                           int sentAt, int dueAt) {
         this.MessageId = id
         this.PeerIp    = ip
         this.PeerPort  = port
         this.Body      = body
         this.SentAtMs  = sentAt
+        this.DueAtMs   = dueAt
         this.Attempts  = 1
     }
 }
@@ -411,12 +414,18 @@ public class Program {
                 let nowP: int    = Program.NowMs()
                 let body: string = Program.EncodeMessage(pUuid, pVer, pData, mid, nowP)
                 UdpSocket_Send(sock, pIp, pPort, body)
-                pending.Add(new PendingMessage(mid, pIp, pPort, body, nowP))
+                // Jittered retry deadline: now + ackTimeout × random
+                // (0.7..1.3). Decorrelates publishers — without jitter
+                // all K publishers retry at +1.000 s exactly, kernel
+                // UDP buffer overflows under the synchronised burst.
+                // 4 bytes of OS entropy → uniform jitter ∈ [-300, +299] ms.
+                let jb1: List<int> = Random.SystemBytes(4)
+                let rR1: int = ((jb1.Get(0) & 255) * 16777216) + ((jb1.Get(1) & 255) * 65536) + ((jb1.Get(2) & 255) * 256) + (jb1.Get(3) & 255)
+                let jit1: int = (rR1 % 600) - 300
+                let dueP: int = nowP + Program.AckTimeoutMs() + jit1
+                pending.Add(new PendingMessage(mid, pIp, pPort, body, nowP, dueP))
                 // ts= goes at the END so log parsers can `grep -oE
                 // 'ts=[0-9]+$'` and join with the ACK line by mid.
-                // First-attempt timestamp: this is what gives the
-                // end-to-end latency (retries log their own ts but
-                // bench computes p50/p99 from the initial send).
                 Console.WriteLine("publish {mid} to {pIp}:{pPort} topic={pUuid} v{pVer} ts={nowP}")
             }
             Console.Flush()
@@ -436,8 +445,7 @@ public class Program {
             var pendingTouched: bool = false
             while (pi < pending.Count()) {
                 let pm: PendingMessage = pending.Get(pi)
-                let due: int = pm.SentAtMs + Program.AckTimeoutMs()
-                if (now < due) { pi = pi + 1; continue }
+                if (now < pm.DueAtMs) { pi = pi + 1; continue }
                 if (pm.Attempts >= Program.MaxAttempts()) {
                     Console.WriteLine("publish TIMEOUT {pm.MessageId} to {pm.PeerIp}:{pm.PeerPort} after {pm.Attempts} attempts")
                     pending.RemoveAt(pi)
@@ -447,6 +455,12 @@ public class Program {
                 UdpSocket_Send(sock, pm.PeerIp, pm.PeerPort, pm.Body)
                 pm.Attempts = pm.Attempts + 1
                 pm.SentAtMs = now
+                // Fresh jitter each retry so successive attempts also
+                // decorrelate. Same ±30 % bracket as the initial send.
+                let jb2: List<int> = Random.SystemBytes(4)
+                let rR2: int = ((jb2.Get(0) & 255) * 16777216) + ((jb2.Get(1) & 255) * 65536) + ((jb2.Get(2) & 255) * 256) + (jb2.Get(3) & 255)
+                let jit2: int = (rR2 % 600) - 300
+                pm.DueAtMs = now + Program.AckTimeoutMs() + jit2
                 Console.WriteLine("publish retry {pm.MessageId} to {pm.PeerIp}:{pm.PeerPort} (attempt {pm.Attempts})")
                 pendingTouched = true
                 pi = pi + 1
