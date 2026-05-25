@@ -27,6 +27,7 @@ namespace Pollen.Client
 
 import Amalgame.Net
 import Amalgame.Formats.Json
+import Amalgame.DateTime
 import Amalgame.Collections
 import Amalgame.String
 
@@ -35,20 +36,20 @@ public class Program {
     // ── helpers ───────────────────────────────────────
 
     public static int NowMs() {
-        let r = Process.RunCapture("date +%s%3N")
-        let s: string = String_Trim(r.Stdout)
-        if (String_Length(s) == 0) { return 0 }
-        return String_ToInt(s)
+        let ns: int = DateTime.NowNanos()
+        return ns / 1000000
     }
 
-    // Pseudo-random ID: epoch-ms + a counter-from-pid. Not RFC 4122
-    // but unique enough for Phase 1.6 to dedup correctly on the
-    // receiver side. Phase 1.x will pull a real UUIDv4 from
-    // amalgame-random once we depend on it (currently Pollen ships
-    // zero external pkg deps).
+    // Pseudo-random ID: nanos-since-epoch + a low-bit shuffle from
+    // the monotonic clock so two clients sharing the wall clock
+    // (clock-stuck VMs, fast CI) still get distinct ids. Not RFC
+    // 4122 but unique enough for the dedup window; a real UUIDv4
+    // lands once we depend on amalgame-random.
     public static string GenId() {
-        let r = Process.RunCapture("printf '%s-%s' \"$(date +%s%N)\" \"$$\"")
-        return String_Trim(r.Stdout)
+        let walls: int = DateTime.NowNanos()
+        let mono:  int = DateTime.NowMonotonicNanos()
+        let suffix: int = mono % 1000000  // last 6 digits of monotonic ns
+        return String_FromInt(walls) + "-" + String_FromInt(suffix)
     }
 
     // Build the MESSAGE envelope as a JSON string.
