@@ -113,6 +113,8 @@ import Amalgame.String
     static int _pollen_cond_active = 0;
     static int _pollen_cond_n_branches = 0;
     static int _pollen_cond_current = -1;
+    /* Phase 5.3 — same hoist for the set-op queue counter. */
+    static int _pollen_n_set_ops = 0;
 
     /* Phase 3.3 — hot-reload guard. Single mutex around the
      * workflow state: writer (AM-side watcher thread reload)
@@ -646,6 +648,8 @@ import Amalgame.String
         _pollen_cond_active = 0;
         _pollen_cond_n_branches = 0;
         _pollen_cond_current = -1;
+        /* Phase 5.3 — drop pending state set-ops on reload. */
+        _pollen_n_set_ops = 0;
         /* _pollen_wf_active stays sticky — once a node has loaded
          * a workflow, free-form fallback no longer kicks in even if
          * the new file is empty. Operator can restart to disable. */
@@ -1066,16 +1070,239 @@ import Amalgame.String
         }
     }
 
+    /* ── Phase 5.3 — persistent state under sharedDir/state ──
+     *
+     * Each execution (identified by its rootMessageId) gets a single
+     * JSON file at <sharedDir>/state/<root-mid>.json containing a
+     * flat object of state keys. `set` actions mutate it via atomic
+     * tmp + rename. `state.X` lookups in conditions read it back.
+     * Survival across crashes is the whole point ; an op-electrique
+     * mid-execution should resume from the last committed state.
+     */
+    #define POLLEN_STATE_FILE_MAX 8192
+
+    static int _pollen_state_filepath(const char* root_mid,
+                                       char* out, size_t cap) {
+        if (!_pollen_shared_dir[0] || !root_mid || !root_mid[0]) return 0;
+        int n = snprintf(out, cap, "%s/state/%s.json",
+                          _pollen_shared_dir, root_mid);
+        return (n > 0 && n < (int) cap);
+    }
+
+    static void _pollen_state_dir_ensure(void) {
+        if (!_pollen_shared_dir[0]) return;
+        char d[600];
+        snprintf(d, sizeof(d), "%s/state", _pollen_shared_dir);
+        mkdir(d, 0755);
+    }
+
+    static int _pollen_state_read(const char* root_mid,
+                                    char* buf, size_t cap) {
+        char path[1024];
+        if (!_pollen_state_filepath(root_mid, path, sizeof(path))) return -1;
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) return -1;
+        ssize_t n = read(fd, buf, cap - 1);
+        close(fd);
+        if (n <= 0) return -1;
+        buf[n] = 0;
+        return (int) n;
+    }
+
+    static int _pollen_state_write(const char* root_mid,
+                                     const char* buf, size_t len) {
+        char path[1024], tmp[1100];
+        if (!_pollen_state_filepath(root_mid, path, sizeof(path))) return 0;
+        _pollen_state_dir_ensure();
+        snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int) getpid());
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) return 0;
+        ssize_t w = write(fd, buf, len);
+        close(fd);
+        if (w != (ssize_t) len) { unlink(tmp); return 0; }
+        if (rename(tmp, path) != 0) { unlink(tmp); return 0; }
+        return 1;
+    }
+
+    /* Mutate a single top-level key in the per-execution state file.
+     * value_lit is a JSON literal (number, quoted string, true, false,
+     * null). For now only top-level keys are supported — `state.X.Y`
+     * is treated as a single key name with a literal dot in it,
+     * which works but doesn't compose with cond eval's dotted
+     * resolution. Phase 5.3.1 will handle nested set. */
+    static int _pollen_state_set(const char* root_mid,
+                                   const char* path,
+                                   const char* json_literal) {
+        const char* key = path;
+        if (strncmp(key, "state.", 6) == 0) key += 6;
+        if (!key[0]) return 0;
+
+        char old_buf[POLLEN_STATE_FILE_MAX];
+        int old_n = _pollen_state_read(root_mid, old_buf, sizeof(old_buf));
+
+        char new_buf[POLLEN_STATE_FILE_MAX];
+        int n = 0;
+
+        if (old_n <= 0) {
+            n = snprintf(new_buf, sizeof(new_buf),
+                          "{\"%s\":%s}\n", key, json_literal);
+        } else {
+            char needle[80];
+            int nlen = snprintf(needle, sizeof(needle), "\"%s\":", key);
+            const char* found = (nlen > 0)
+                ? _pollen_find(old_buf, (size_t) old_n,
+                                 needle, (size_t) nlen)
+                : NULL;
+            if (found) {
+                const char* v = found + nlen;
+                const char* v_end = v;
+                if (*v == '"') {
+                    v_end = v + 1;
+                    while (v_end < old_buf + old_n && *v_end != '"') {
+                        if (*v_end == '\\' && v_end + 1 < old_buf + old_n) v_end++;
+                        v_end++;
+                    }
+                    if (v_end < old_buf + old_n) v_end++;
+                } else if (*v == '{' || *v == '[') {
+                    char open = *v; char close = (open == '{') ? '}' : ']';
+                    int depth = 0;
+                    v_end = v;
+                    while (v_end < old_buf + old_n) {
+                        if (*v_end == open) depth++;
+                        else if (*v_end == close) {
+                            depth--;
+                            if (depth == 0) { v_end++; break; }
+                        }
+                        v_end++;
+                    }
+                } else {
+                    while (v_end < old_buf + old_n
+                           && *v_end != ',' && *v_end != '}'
+                           && *v_end != ' ' && *v_end != '\n'
+                           && *v_end != '\r' && *v_end != '\t') v_end++;
+                }
+                int prefix_n = (int)(v - old_buf);
+                int suffix_n = old_n - (int)(v_end - old_buf);
+                n = snprintf(new_buf, sizeof(new_buf), "%.*s%s%.*s",
+                              prefix_n, old_buf, json_literal,
+                              suffix_n, v_end);
+            } else {
+                int close_at = -1;
+                for (int i = old_n - 1; i >= 0; i--) {
+                    if (old_buf[i] == '}') { close_at = i; break; }
+                }
+                if (close_at < 0) return 0;
+                int has_fields = 0;
+                for (int i = 0; i < close_at; i++) {
+                    char c = old_buf[i];
+                    if (c == ':') { has_fields = 1; break; }
+                }
+                const char* sep = has_fields ? "," : "";
+                n = snprintf(new_buf, sizeof(new_buf),
+                              "%.*s%s\"%s\":%s%.*s",
+                              close_at, old_buf, sep, key, json_literal,
+                              old_n - close_at, old_buf + close_at);
+            }
+        }
+
+        if (n <= 0 || n >= (int) sizeof(new_buf)) return 0;
+        return _pollen_state_write(root_mid, new_buf, (size_t) n);
+    }
+
+    /* ── set-op storage ─────────────────────────────────────────
+     *
+     * AM-side load registers up to N (path, value_lit) pairs to be
+     * applied to the state file before each forward. Cleared on
+     * reload alongside cond/next state. */
+    #define POLLEN_SET_OPS_MAX 8
+
+    typedef struct {
+        char path[POLLEN_COND_VAR_MAX];
+        char value_lit[POLLEN_COND_STR_MAX];
+    } pollen_set_op_t;
+
+    static pollen_set_op_t _pollen_set_ops[POLLEN_SET_OPS_MAX];
+    /* _pollen_n_set_ops declared in the early @c block (hoisted for
+     * reload_begin). */
+
+    static void _pollen_set_ops_clear(void) {
+        _pollen_n_set_ops = 0;
+    }
+
+    static void _pollen_set_ops_add(const char* path,
+                                      const char* value_lit) {
+        if (_pollen_n_set_ops >= POLLEN_SET_OPS_MAX) return;
+        strncpy(_pollen_set_ops[_pollen_n_set_ops].path, path,
+                 POLLEN_COND_VAR_MAX - 1);
+        _pollen_set_ops[_pollen_n_set_ops].path[POLLEN_COND_VAR_MAX - 1] = 0;
+        strncpy(_pollen_set_ops[_pollen_n_set_ops].value_lit, value_lit,
+                 POLLEN_COND_STR_MAX - 1);
+        _pollen_set_ops[_pollen_n_set_ops].value_lit[POLLEN_COND_STR_MAX - 1] = 0;
+        _pollen_n_set_ops++;
+    }
+
+    /* Extract rootMessageId from the envelope. Returns 1 on success. */
+    static int _pollen_extract_root_mid(const char* env, size_t env_len,
+                                          char* out, size_t cap) {
+        const char* k = _pollen_find(env, env_len,
+                                       "\"rootMessageId\":\"", 17);
+        if (!k) return 0;
+        const char* v = k + 17;
+        const char* q = memchr(v, '"', env_len - (size_t)(v - env));
+        if (!q) return 0;
+        size_t rlen = (size_t)(q - v);
+        if (rlen == 0 || rlen >= cap) return 0;
+        memcpy(out, v, rlen); out[rlen] = 0;
+        return 1;
+    }
+
+    /* Apply all pending set ops against the state file for the
+     * envelope's rootMessageId. Best-effort : skip silently if the
+     * envelope lacks rootMessageId or if write fails. */
+    static void _pollen_set_ops_apply(const char* env, size_t env_len) {
+        if (_pollen_n_set_ops == 0) return;
+        char root[64];
+        if (!_pollen_extract_root_mid(env, env_len, root, sizeof(root))) return;
+        for (int i = 0; i < _pollen_n_set_ops; i++) {
+            if (_pollen_state_set(root,
+                                   _pollen_set_ops[i].path,
+                                   _pollen_set_ops[i].value_lit)) {
+                fprintf(stdout, "state-set: %s = %s (root=%s)\n",
+                    _pollen_set_ops[i].path,
+                    _pollen_set_ops[i].value_lit, root);
+                fflush(stdout);
+            }
+        }
+    }
+
     /* Evaluate one branch's condition against the envelope. */
     static int _pollen_cond_eval(pollen_cond_branch_t* b,
                                    const char* env, size_t env_len) {
         if (b->op == POLLEN_COND_NONE) return 1;  /* else / always */
 
-        /* Phase 5.2.1 — dotted path resolution. `data.X` walks into
+        /* Phase 5.3 — `state.X` resolves against the per-execution
+         * state file rather than the envelope.
+         * Phase 5.2.1 — dotted path resolution. `data.X` walks into
          * the data object ; bare `X` looks at the envelope root. */
+        const char* lookup_buf = env;
+        size_t lookup_len = env_len;
+        const char* lookup_path = b->var_path;
+        char state_buf[POLLEN_STATE_FILE_MAX];
+
+        if (strncmp(b->var_path, "state.", 6) == 0) {
+            char root[64];
+            if (!_pollen_extract_root_mid(env, env_len,
+                                            root, sizeof(root))) return 0;
+            int sn = _pollen_state_read(root, state_buf, sizeof(state_buf));
+            if (sn <= 0) return 0;
+            lookup_buf = state_buf;
+            lookup_len = (size_t) sn;
+            lookup_path = b->var_path + 6;
+        }
+
         const char* val_ptr = NULL;
         size_t val_len = 0;
-        if (!_pollen_resolve_path(env, env_len, b->var_path,
+        if (!_pollen_resolve_path(lookup_buf, lookup_len, lookup_path,
                                     &val_ptr, &val_len)) return 0;
 
         const char* v = val_ptr;
@@ -1240,10 +1467,11 @@ import Amalgame.String
             int dlen = snprintf(data, sizeof(data), dataTemplate, (int) i);
             int64_t now = _pollen_now_ms_c();
             int env_len = snprintf(envelope, sizeof(envelope),
-                "{\"messageId\":\"%s\",\"type\":\"MESSAGE\","
+                "{\"messageId\":\"%s\",\"rootMessageId\":\"%s\","
+                "\"type\":\"MESSAGE\","
                 "\"topic\":{\"uuid\":\"%s\",\"version\":%lld},"
                 "\"data\":%s,\"timestamp\":%lld}\n",
-                m, topicUuid, (long long) topicVersion, data, (long long) now);
+                m, m, topicUuid, (long long) topicVersion, data, (long long) now);
             (void) dlen;
             if (send(fd, envelope, (size_t) env_len, MSG_NOSIGNAL) < 0) break;
             fprintf(stdout, "publish %s to %s:%lld topic=%s v%lld ts=%lld\n",
@@ -1593,6 +1821,14 @@ import Amalgame.String
                                 }
                             }
 
+                            /* Phase 5.3 — apply pending state set-ops
+                             * before routing. The mutated state must
+                             * be visible to any conditional eval that
+                             * follows on the SAME node ; downstream
+                             * nodes will see it via their own state
+                             * reads. */
+                            _pollen_set_ops_apply(fwd_buf, fwd_buf_len);
+
                             char fwd_new_mid[37] = {0};
                             if (_pollen_cond_active) {
                                 /* Phase 5.2 — conditional routing.
@@ -1793,7 +2029,13 @@ public class Program {
         if (String_Length(debugJson) > 0) {
             dbg = ",\"debug\":" + debugJson
         }
+        // Phase 5.3 — rootMessageId is propagated through every
+        // forward hop so persistent state files can key by the
+        // execution's first-hop mid. At root insertion the value
+        // equals the local mid ; downstream hops preserve it via
+        // _pollen_wf_rebuild_envelope.
         return "{\"messageId\":\"" + mid +
+               "\",\"rootMessageId\":\"" + mid +
                "\",\"type\":\"MESSAGE\"," +
                "\"topic\":{\"uuid\":\"" + tu +
                "\",\"version\":" + tv + "}," +
@@ -1957,6 +2199,60 @@ public class Program {
         return empty
     }
 
+    // Phase 5.3 — return the list of `set` step JsonValues between
+    // role's step and the next dispatcher (call / fan_out / if /
+    // end). The caller iterates these to register set ops, then
+    // calls FindDispatcherAfter to get the actual dispatch action.
+    public static List<JsonValue> CollectSetsAfter(JsonValue treeV, string role) {
+        let out: List<JsonValue> = new List<JsonValue>()
+        if (!treeV.IsObject()) { return out }
+        if (treeV.Get("type").AsString() != "sequence") { return out }
+        let stepsV: JsonValue = treeV.Get("steps")
+        if (!stepsV.IsArray()) { return out }
+        let steps: List<JsonValue> = stepsV.AsArray()
+        let n: int = steps.Count()
+        var found: int = -1
+        for i in 0..n {
+            if (Program.StepNames(steps.Get(i), role)) { found = i; break }
+        }
+        if (found < 0) { return out }
+        var j: int = found + 1
+        while (j < n) {
+            let step: JsonValue = steps.Get(j)
+            if (!step.IsObject()) { break }
+            if (step.Get("type").AsString() != "set") { break }
+            out.Add(step)
+            j = j + 1
+        }
+        return out
+    }
+
+    // Return the first non-`set` action after role's step. Skips
+    // over any number of `set` steps so dispatch lookup sees what
+    // would naturally come next once the state mutations are done.
+    public static JsonValue FindDispatcherAfter(JsonValue treeV, string role) {
+        let empty: JsonValue = new JsonValue()
+        if (!treeV.IsObject()) { return empty }
+        if (treeV.Get("type").AsString() != "sequence") { return empty }
+        let stepsV: JsonValue = treeV.Get("steps")
+        if (!stepsV.IsArray()) { return empty }
+        let steps: List<JsonValue> = stepsV.AsArray()
+        let n: int = steps.Count()
+        var found: int = -1
+        for i in 0..n {
+            if (Program.StepNames(steps.Get(i), role)) { found = i; break }
+        }
+        if (found < 0) { return empty }
+        var j: int = found + 1
+        while (j < n) {
+            let step: JsonValue = steps.Get(j)
+            if (!step.IsObject()) { return empty }
+            if (step.Get("type").AsString() != "set") { return step }
+            j = j + 1
+        }
+        return empty
+    }
+
     // Find the "next" targets after `role` in the tree. Walks one
     // level of sequence — Phase 5.4 will extend for nested
     // structures + while/for loops.
@@ -2073,10 +2369,33 @@ public class Program {
         var nxtSReal: string = nxtS
         if (hasTree) {
             nxtSrcTag = "tree"
-            // First check whether the next action is an `if` — that
-            // path populates the conditional routing table instead of
-            // the flat next[].
-            let nextAction: JsonValue = Program.FindActionRawAfter(treeV, role)
+            // Phase 5.3 — walk past any `set` steps first, registering
+            // each as a pending state mutation. The next dispatcher
+            // (call/fan_out/if) is what determines actual routing.
+            let setSteps: List<JsonValue> = Program.CollectSetsAfter(treeV, role)
+            let sCount: int = setSteps.Count()
+            for si in 0..sCount {
+                let setStep: JsonValue = setSteps.Get(si)
+                let pathV: JsonValue = setStep.Get("path")
+                let valueV: JsonValue = setStep.Get("value")
+                let p: string = pathV.AsString()
+                // For MVP : value is {"const": <literal>}. Anything
+                // else gets serialized as a JSON fragment and stored
+                // raw, which works for nested objects but not for
+                // var refs (Phase 5.3.1 will wire {"var": "X"}).
+                var lit: string = "null"
+                if (valueV.IsObject() && valueV.Has("const")) {
+                    lit = Json.Encode(valueV.Get("const"))
+                } else if (valueV.IsObject()) {
+                    lit = Json.Encode(valueV)
+                } else {
+                    lit = Json.Encode(valueV)
+                }
+                if (String_Length(p) > 0) {
+                    @c { _pollen_set_ops_add(p, lit); }
+                }
+            }
+            let nextAction: JsonValue = Program.FindDispatcherAfter(treeV, role)
             var nextKind: string = ""
             if (nextAction.IsObject()) {
                 nextKind = nextAction.Get("type").AsString()
@@ -2139,7 +2458,11 @@ public class Program {
                     nxtSReal = inner
                 }
             } else {
-            let treeTargets: List<string> = Program.FindActionAfter(treeV, role)
+            // Phase 5.3 — dispatch from the post-set dispatcher rather
+            // than the raw next step ; this lets a sequence like
+            // [call(x), set(...), set(...), fan_out(y,z)] still route
+            // x → [y, z].
+            let treeTargets: List<string> = Program.ActionTargets(nextAction)
             let tn: int = treeTargets.Count()
             var inner: string = ""
             for ti in 0..tn {
