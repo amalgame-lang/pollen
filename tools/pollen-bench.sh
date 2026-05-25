@@ -33,12 +33,14 @@ M=100
 TOPIC="bench-topic-00000000-0000-4000-8000-000000000000"
 NODE_BIN="${POLLEN_NODE_BIN:-}"
 
+FORCE_BIG=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -k) K="$2"; shift 2 ;;
         -m) M="$2"; shift 2 ;;
         -t) TOPIC="$2"; shift 2 ;;
         -b) NODE_BIN="$2"; shift 2 ;;
+        -F) FORCE_BIG=1; shift ;;
         -h|--help)
             sed -n '2,30p' "$0"; exit 0 ;;
         *)
@@ -48,12 +50,8 @@ done
 
 # Resource guard: pollen-node since v0.1.0-dev (Phase 1.5c) spawns
 # its own acceptor thread, so K publishers = K × 2 threads + 1
-# receiver. On a small VM (≤4 cores, ≤2 GB RAM), K above 8 can
-# overwhelm the scheduler / OOM-kill the host. Refuse to launch
-# something that's likely to crash the box; users on bare metal
-# can override with -F (force).
-FORCE_BIG=0
-if [ "${1:-}" = "-F" ]; then FORCE_BIG=1; shift; fi
+# receiver. On a small VM (≤4 cores, ≤2 GB RAM), K above 12 can
+# overwhelm the scheduler / OOM-kill the host. -F bypasses.
 if [ "$K" -gt 12 ] && [ "$FORCE_BIG" -eq 0 ]; then
     echo "pollen-bench: K=$K asks for $((K * 2 + 1)) threads + $((K + 1)) processes." >&2
     echo "              This has crashed small VMs in testing. Either:" >&2
