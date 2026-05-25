@@ -106,6 +106,14 @@ import Amalgame.String
      * node doesn't transform). */
     static char _pollen_wf_emit_topic[POLLEN_TOPIC_MAX] = "";
 
+    /* Phase 5.2 — conditional routing flag.
+     * Hoisted here so the reload path (defined in this same block)
+     * can clear it. Struct + branch table + helpers live in a later
+     * @c block. */
+    static int _pollen_cond_active = 0;
+    static int _pollen_cond_n_branches = 0;
+    static int _pollen_cond_current = -1;
+
     /* Phase 3.3 — hot-reload guard. Single mutex around the
      * workflow state: writer (AM-side watcher thread reload)
      * holds it for ~1 ms during the begin / add_ / commit
@@ -633,6 +641,11 @@ import Amalgame.String
         _pollen_wf_n_consumes = 0;
         _pollen_wf_n_nexts = 0;
         _pollen_wf_emit_topic[0] = '\0';
+        /* Phase 5.2 — also clear conditional routing so a reload that
+         * drops the `if` reverts to plain fan_out. */
+        _pollen_cond_active = 0;
+        _pollen_cond_n_branches = 0;
+        _pollen_cond_current = -1;
         /* _pollen_wf_active stays sticky — once a node has loaded
          * a workflow, free-form fallback no longer kicks in even if
          * the new file is empty. Operator can restart to disable. */
@@ -855,6 +868,220 @@ import Amalgame.String
                                    _pollen_wf_next_port[i],
                                    fwd, fwd_len);
         }
+    }
+
+    /* ── Phase 5.2 — conditional routing (`if` action) ────────
+     *
+     * When the role's next-step in the tree is an `{type:"if",
+     * branches:[{cond, action}, ...], else?}`, routing becomes
+     * runtime : we evaluate each branch's `cond` against the
+     * incoming envelope's `data` field and forward to the FIRST
+     * matching branch's targets. If no branch matches and an
+     * `else` is set, forward to its targets. Otherwise drop.
+     *
+     * Cond schema for 5.2 (intentionally minimal — Phase 5.2.1
+     * extends with and/or/not/nested) :
+     *
+     *   { "op": "==|!=|<|>|<=|>=",
+     *     "left":  { "var": "data.X" },
+     *     "right": { "const": <num | "str" | true | false> } }
+     *
+     * Storage : static globals populated by AM-side LoadWorkflow.
+     * Protected by the same _pollen_wf_mutex as next[] so a
+     * hot-reload swap stays atomic.
+     */
+    #define POLLEN_COND_MAX_BRANCHES   8
+    #define POLLEN_COND_VAR_MAX        64
+    #define POLLEN_COND_STR_MAX        128
+
+    /* op codes */
+    #define POLLEN_COND_NONE   0  /* else / always-true */
+    #define POLLEN_COND_EQ     1
+    #define POLLEN_COND_NE     2
+    #define POLLEN_COND_LT     3
+    #define POLLEN_COND_GT     4
+    #define POLLEN_COND_LE     5
+    #define POLLEN_COND_GE     6
+
+    typedef struct {
+        char    var_path[POLLEN_COND_VAR_MAX];
+        int     op;
+        int     rhs_is_num;
+        double  rhs_num;
+        char    rhs_str[POLLEN_COND_STR_MAX];
+        char    targets_host[POLLEN_MAX_NEXTS][POLLEN_HOST_MAX];
+        int     targets_port[POLLEN_MAX_NEXTS];
+        int     n_targets;
+    } pollen_cond_branch_t;
+
+    /* _pollen_cond_active, _pollen_cond_n_branches, _pollen_cond_current
+     * are declared in the earlier hot-path @c block so reload_begin
+     * can reset them. Only the table of branches lives here (needs
+     * the struct above). */
+    static pollen_cond_branch_t _pollen_cond_branches[POLLEN_COND_MAX_BRANCHES];
+
+    /* Reset + open + add-target + close, called by AM-side
+     * LoadWorkflow when an `if` is detected. */
+    static void _pollen_cond_clear(void) {
+        _pollen_cond_active = 0;
+        _pollen_cond_n_branches = 0;
+        _pollen_cond_current = -1;
+    }
+
+    static void _pollen_cond_branch_open(const char* var_path, int op,
+                                          int rhs_is_num, double rhs_num,
+                                          const char* rhs_str) {
+        if (_pollen_cond_n_branches >= POLLEN_COND_MAX_BRANCHES) return;
+        _pollen_cond_active = 1;
+        _pollen_cond_current = _pollen_cond_n_branches;
+        pollen_cond_branch_t* b = &_pollen_cond_branches[_pollen_cond_current];
+        strncpy(b->var_path, var_path ? var_path : "", sizeof(b->var_path) - 1);
+        b->var_path[sizeof(b->var_path) - 1] = 0;
+        b->op = op;
+        b->rhs_is_num = rhs_is_num;
+        b->rhs_num = rhs_num;
+        strncpy(b->rhs_str, rhs_str ? rhs_str : "", sizeof(b->rhs_str) - 1);
+        b->rhs_str[sizeof(b->rhs_str) - 1] = 0;
+        b->n_targets = 0;
+        _pollen_cond_n_branches++;
+    }
+
+    /* AM-callable wrapper : op is passed as the JSON string ("==",
+     * ">", …) and resolved to the int code here. Empty op means
+     * `else` / always-true. */
+    static void _pollen_cond_branch_open_s(const char* var_path,
+                                             const char* op_str,
+                                             int rhs_is_num,
+                                             double rhs_num,
+                                             const char* rhs_str) {
+        int op = POLLEN_COND_NONE;
+        if (op_str && op_str[0]) {
+            if      (!strcmp(op_str, "==")) op = POLLEN_COND_EQ;
+            else if (!strcmp(op_str, "!=")) op = POLLEN_COND_NE;
+            else if (!strcmp(op_str, "<"))  op = POLLEN_COND_LT;
+            else if (!strcmp(op_str, ">"))  op = POLLEN_COND_GT;
+            else if (!strcmp(op_str, "<=")) op = POLLEN_COND_LE;
+            else if (!strcmp(op_str, ">=")) op = POLLEN_COND_GE;
+        }
+        _pollen_cond_branch_open(var_path ? var_path : "", op,
+                                  rhs_is_num, rhs_num,
+                                  rhs_str ? rhs_str : "");
+    }
+
+    static void _pollen_cond_branch_add_target(const char* host, int port) {
+        if (_pollen_cond_current < 0
+            || _pollen_cond_current >= _pollen_cond_n_branches) return;
+        pollen_cond_branch_t* b = &_pollen_cond_branches[_pollen_cond_current];
+        if (b->n_targets >= POLLEN_MAX_NEXTS) return;
+        strncpy(b->targets_host[b->n_targets], host, POLLEN_HOST_MAX - 1);
+        b->targets_host[b->n_targets][POLLEN_HOST_MAX - 1] = 0;
+        b->targets_port[b->n_targets] = port;
+        b->n_targets++;
+    }
+
+    /* Evaluate one branch's condition against the envelope. */
+    static int _pollen_cond_eval(pollen_cond_branch_t* b,
+                                   const char* env, size_t env_len) {
+        if (b->op == POLLEN_COND_NONE) return 1;  /* else / always */
+
+        /* Naive lookup : strip "data." prefix, search for
+         * "<key>": within the envelope. Works for top-level keys
+         * inside the data object. Phase 5.2.1 will add dotted
+         * path resolution. */
+        const char* path = b->var_path;
+        if (strncmp(path, "data.", 5) == 0) path += 5;
+
+        char needle[80];
+        int nlen = snprintf(needle, sizeof(needle), "\"%s\":", path);
+        if (nlen <= 0 || nlen >= (int) sizeof(needle)) return 0;
+
+        const char* k = _pollen_find(env, env_len, needle, (size_t) nlen);
+        if (!k) return 0;
+        const char* v = k + nlen;
+        while (v < env + env_len && (*v == ' ' || *v == '\t')) v++;
+        if (v >= env + env_len) return 0;
+
+        double v_num = 0; int v_is_num = 0;
+        char v_str[128] = "";
+
+        if (*v == '"') {
+            v++;
+            const char* q = memchr(v, '"', env_len - (size_t)(v - env));
+            if (!q) return 0;
+            size_t slen = (size_t)(q - v);
+            if (slen >= sizeof(v_str)) slen = sizeof(v_str) - 1;
+            memcpy(v_str, v, slen);
+            v_str[slen] = 0;
+        } else if ((*v >= '0' && *v <= '9') || *v == '-' || *v == '+' || *v == '.') {
+            v_num = atof(v);
+            v_is_num = 1;
+        } else if (env + env_len - v >= 4 && memcmp(v, "true", 4) == 0) {
+            strcpy(v_str, "true");
+        } else if (env + env_len - v >= 5 && memcmp(v, "false", 5) == 0) {
+            strcpy(v_str, "false");
+        } else if (env + env_len - v >= 4 && memcmp(v, "null", 4) == 0) {
+            strcpy(v_str, "null");
+        } else {
+            return 0;
+        }
+
+        if (b->rhs_is_num && v_is_num) {
+            double d = v_num - b->rhs_num;
+            switch (b->op) {
+                case POLLEN_COND_EQ: return d == 0;
+                case POLLEN_COND_NE: return d != 0;
+                case POLLEN_COND_LT: return d <  0;
+                case POLLEN_COND_GT: return d >  0;
+                case POLLEN_COND_LE: return d <= 0;
+                case POLLEN_COND_GE: return d >= 0;
+            }
+        } else if (!b->rhs_is_num) {
+            int c = strcmp(v_str, b->rhs_str);
+            switch (b->op) {
+                case POLLEN_COND_EQ: return c == 0;
+                case POLLEN_COND_NE: return c != 0;
+                case POLLEN_COND_LT: return c <  0;
+                case POLLEN_COND_GT: return c >  0;
+                case POLLEN_COND_LE: return c <= 0;
+                case POLLEN_COND_GE: return c >= 0;
+            }
+        }
+        return 0;
+    }
+
+    /* Conditional forward : evaluate branches top-down, first true
+     * dispatches to its targets via _pollen_wf_forward_one. The
+     * envelope is rewritten once via _pollen_wf_rebuild_envelope
+     * (fresh messageId + parent chain + topic) before being sent
+     * to every chosen target. */
+    static void _pollen_cond_forward(const char* env, size_t env_len,
+                                      char* out_new_mid) {
+        for (int i = 0; i < _pollen_cond_n_branches; i++) {
+            pollen_cond_branch_t* b = &_pollen_cond_branches[i];
+            if (_pollen_cond_eval(b, env, env_len)) {
+                char rebuilt[8192];
+                const char* fwd = env;
+                size_t fwd_len = env_len;
+                const char* new_topic = _pollen_wf_emit_topic[0] ?
+                                        _pollen_wf_emit_topic : NULL;
+                size_t rn = _pollen_wf_rebuild_envelope(env, env_len,
+                                                         rebuilt, sizeof(rebuilt),
+                                                         new_topic, out_new_mid);
+                if (rn > 0) { fwd = rebuilt; fwd_len = rn; }
+                for (int t = 0; t < b->n_targets; t++) {
+                    _pollen_wf_forward_one(b->targets_host[t],
+                                            b->targets_port[t],
+                                            fwd, fwd_len);
+                }
+                fprintf(stdout,
+                    "tree-if: branch[%d] matched → forwarded to %d target(s)\n",
+                    i, b->n_targets);
+                fflush(stdout);
+                return;
+            }
+        }
+        fprintf(stdout, "tree-if: no branch matched → drop\n");
+        fflush(stdout);
     }
 
     /* Portable substring search — memmem is glibc-only and _GNU_SOURCE
@@ -1281,7 +1508,44 @@ import Amalgame.String
                             }
 
                             char fwd_new_mid[37] = {0};
-                            if (_pollen_wf_n_nexts > 0) {
+                            if (_pollen_cond_active) {
+                                /* Phase 5.2 — conditional routing.
+                                 * Branches were resolved at load
+                                 * time ; here we just pick the first
+                                 * matching one and forward. The
+                                 * branch's own targets handle the
+                                 * envelope rewrite + new mid. */
+                                _pollen_cond_forward(fwd_buf, fwd_buf_len,
+                                                      fwd_new_mid);
+                                if (parent_start) {
+                                    fprintf(stdout,
+                                        "workflow: consumed topic=%.*s "
+                                        "msg=%.*s parent=%.*s "
+                                        "→ if-route (emit topic=%s)\n",
+                                        (int) topic_len, topic_start,
+                                        (int) midlen, mp,
+                                        (int) parent_len, parent_start,
+                                        _pollen_wf_emit_topic[0] ? _pollen_wf_emit_topic : "(verbatim)");
+                                } else {
+                                    fprintf(stdout,
+                                        "workflow: consumed topic=%.*s "
+                                        "msg=%.*s (root) "
+                                        "→ if-route (emit topic=%s)\n",
+                                        (int) topic_len, topic_start,
+                                        (int) midlen, mp,
+                                        _pollen_wf_emit_topic[0] ? _pollen_wf_emit_topic : "(verbatim)");
+                                }
+                                if (fwd_new_mid[0]) {
+                                    _pollen_wf_record_step(
+                                        fwd_new_mid, 36,
+                                        mp, midlen,
+                                        topic_start, topic_len,
+                                        _pollen_wf_emit_topic[0] ?
+                                            _pollen_wf_emit_topic : NULL,
+                                        1,
+                                        dbg_session, dbg_session_len);
+                                }
+                            } else if (_pollen_wf_n_nexts > 0) {
                                 _pollen_wf_forward_all(fwd_buf, fwd_buf_len,
                                                        fwd_new_mid);
                                 if (parent_start) {
@@ -1581,6 +1845,32 @@ public class Program {
         return out
     }
 
+    // Find the raw Action object (call / fan_out / if / end / …)
+    // that immediately follows `role`'s step in the top-level
+    // sequence. Returns an empty JsonValue if role is terminal or
+    // not found. Phase 5.2 uses this to distinguish flat fan_out
+    // (handled by ActionTargets + _pollen_wf_add_next) from `if`
+    // (handled by _pollen_cond_branch_open_s + add_target).
+    public static JsonValue FindActionRawAfter(JsonValue treeV, string role) {
+        let empty: JsonValue = new JsonValue()
+        if (!treeV.IsObject()) { return empty }
+        let kind: string = treeV.Get("type").AsString()
+        if (kind == "sequence") {
+            let stepsV: JsonValue = treeV.Get("steps")
+            if (!stepsV.IsArray()) { return empty }
+            let steps: List<JsonValue> = stepsV.AsArray()
+            let n: int = steps.Count()
+            for i in 0..n {
+                let step: JsonValue = steps.Get(i)
+                if (Program.StepNames(step, role)) {
+                    if (i + 1 < n) { return steps.Get(i + 1) }
+                    return empty
+                }
+            }
+        }
+        return empty
+    }
+
     // Find the "next" targets after `role` in the tree. Walks one
     // level of sequence — Phase 5.4 will extend for nested
     // structures + while/for loops.
@@ -1697,6 +1987,72 @@ public class Program {
         var nxtSReal: string = nxtS
         if (hasTree) {
             nxtSrcTag = "tree"
+            // First check whether the next action is an `if` — that
+            // path populates the conditional routing table instead of
+            // the flat next[].
+            let nextAction: JsonValue = Program.FindActionRawAfter(treeV, role)
+            var nextKind: string = ""
+            if (nextAction.IsObject()) {
+                nextKind = nextAction.Get("type").AsString()
+            }
+            if (nextKind == "if") {
+                nxtSrcTag = "tree.if"
+                let branchesV: JsonValue = nextAction.Get("branches")
+                if (branchesV.IsArray()) {
+                    let branches: List<JsonValue> = branchesV.AsArray()
+                    let bn: int = branches.Count()
+                    var inner: string = ""
+                    for bi in 0..bn {
+                        let br: JsonValue = branches.Get(bi)
+                        if (!br.IsObject()) { continue }
+                        let opV: JsonValue   = br.Get("op")
+                        let varV: JsonValue  = br.Get("var")
+                        let valV: JsonValue  = br.Get("value")
+                        let thenV: JsonValue = br.Get("then")
+                        let op: string  = opV.AsString()
+                        let varP: string = varV.AsString()
+                        var isNum: int  = 0
+                        var numVal: float = 0.0
+                        var strVal: string = ""
+                        if (valV.IsNumber()) {
+                            isNum = 1
+                            // JSON 1000 lands as Int (AsFloat → 0.0
+                            // for non-float kinds). Pick the right
+                            // accessor or the rhs collapses to zero.
+                            if (valV.IsInt()) {
+                                let iv: int = valV.AsInt()
+                                numVal = iv * 1.0
+                            } else {
+                                numVal = valV.AsFloat()
+                            }
+                        } else if (valV.IsString()) {
+                            strVal = valV.AsString()
+                        } else if (valV.IsBool()) {
+                            if (valV.AsBool()) { strVal = "true" } else { strVal = "false" }
+                        }
+                        @c { _pollen_cond_branch_open_s(varP, op, (int) isNum,
+                                                         (double) numVal, strVal); }
+                        // Resolve `then` targets to (host, port) and
+                        // register against this branch slot.
+                        let thenTargets: List<string> = Program.ActionTargets(thenV)
+                        let tcount: int = thenTargets.Count()
+                        for ti in 0..tcount {
+                            let nextRole: string = thenTargets.Get(ti)
+                            if (String_Length(inner) > 0) { inner = inner + "," }
+                            inner = inner + nextRole
+                            let nextNode: JsonValue = Program.FindNodeByKey(nodesV, nextRole)
+                            if (nextNode.IsObject()) {
+                                let nhV: JsonValue = nextNode.Get("host")
+                                let npV: JsonValue = nextNode.Get("port")
+                                let nh: string = nhV.AsString()
+                                let np: int    = npV.AsInt()
+                                @c { _pollen_cond_branch_add_target(nh, (int) np); }
+                            }
+                        }
+                    }
+                    nxtSReal = inner
+                }
+            } else {
             let treeTargets: List<string> = Program.FindActionAfter(treeV, role)
             let tn: int = treeTargets.Count()
             var inner: string = ""
@@ -1714,6 +2070,7 @@ public class Program {
                 }
             }
             nxtSReal = inner
+            }
         } else if (nxtV.IsArray()) {
             let nxtItems: List<JsonValue> = nxtV.AsArray()
             let xn: int = nxtItems.Count()
