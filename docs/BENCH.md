@@ -193,6 +193,49 @@ done
 
 Each run prints a result block as shown above.
 
+## Hardware ceiling — what's actually possible on this VM
+
+To know how much headroom Pollen has left, we ran a **pure-C
+pipelined ping-pong** with the same protocol shape (32 concurrent
+TCP connections, each pipelining 1,000 JSON-shaped MESSAGE + ACK
+round-trips). Same VM, same kernel, same wire format, no AM stack,
+no GC, no closures:
+
+```
+RAW C K=32 M=1000 — 5 runs:
+  271,186 msg/s  (118 ms)
+  163,265 msg/s  (196 ms)
+  152,381 msg/s  (210 ms)
+  130,612 msg/s  (245 ms)
+  139,130 msg/s  (230 ms)
+  ---
+  mean ≈ 171,300 msg/s  (high variance, CV ~30%)
+```
+
+So the **architectural ceiling on this 2-vCPU VM with this wire
+shape is ~170 k msg/s** (sustained), peaking at 271 k. Pollen's
+63 k stable / 71 k peak puts us at **37 %** of that ceiling.
+
+The remaining gap lives in the **AM Main** path that runs once per
+publisher before the hot-path C function takes over:
+
+- `String_Split` on the `--burst` spec (6-field split + colon
+  re-join of the data field)
+- `String_ToInt` on port + version + count
+- amc closure setup for the worker spawn
+- Process startup / dynamic loader / GC initial state
+
+Per-publisher AM startup is ~5-10 ms on this hardware. At K=32
+those 32 × ~7 ms startups happen partly in parallel but with the
+2-vCPU scheduler they serialise enough to add ~50-100 ms of wall
+time on top of the actual send/recv burst.
+
+In other words: we are not bottlenecked by the network, the TCP
+stack, or our per-message C work. We are bottlenecked by **how
+many publisher processes the kernel can wake and AM-bootstrap per
+millisecond on a 2-core VM**. A 4-core box or a single multi-
+worker publisher process should land us closer to 100 k msg/s.
+
 ## What's left on the perf ladder
 
 Audit-able opportunities:
