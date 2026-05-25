@@ -107,6 +107,35 @@ pollen version                                       Print version + amc binding
 pollen help                                          Help.
 ```
 
+### Load test (built-in)
+
+```bash
+pollen bench -k 4 -m 100      # 4 publishers × 100 msgs each = 400 publishes
+pollen bench -k 8 -m 500      # heavy: 4000 msgs
+```
+
+Spawns 1 receiver + K publisher nodes (each with M `--publish`
+specs), waits for every publish to ACK or exhaust retries, then
+parses the logs:
+
+```
+── results ──
+  elapsed:           102 ms (0.10 s)
+  total sent:        400 msgs (4 × 100)
+  publish complete:  400 (100.0%)
+  publish retry:     0
+  publish TIMEOUT:   0
+  recv MESSAGE:      400 events (first-sight 400, dupes 0)
+  throughput:        3921.6 msgs/s
+
+OK all 400 publishes ACK'd
+```
+
+A K=8 M=500 run on loopback typically hits ~1k msgs/s with ~50 %
+retry rate (kernel UDP buffer overflow under burst) and a handful
+of dedup hits — the retry-then-dedup-swallow pattern keeps the
+end-to-end delivery at 100 %.
+
 ### sharedDir layout
 
 ```

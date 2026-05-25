@@ -170,10 +170,13 @@ gcc -O2 -I"$AMC_RUNTIME" $PKG_INCS "$BUILD_DIR/pollen-client.c" \
 
 # ── Install ────────────────────────────────────────
 mkdir -p "$BIN_DIR" "$SHARE_DIR/bin"
-cp "$BUILD_DIR/pollen-node-bin"   "$SHARE_DIR/bin/pollen-node"
-cp "$BUILD_DIR/pollen-client-bin" "$SHARE_DIR/bin/pollen-client"
-cp "$SRC_DIR/tools/pollen"        "$BIN_DIR/pollen"
-chmod +x "$BIN_DIR/pollen" "$SHARE_DIR/bin/pollen-node" "$SHARE_DIR/bin/pollen-client"
+cp "$BUILD_DIR/pollen-node-bin"     "$SHARE_DIR/bin/pollen-node"
+cp "$BUILD_DIR/pollen-client-bin"   "$SHARE_DIR/bin/pollen-client"
+cp "$SRC_DIR/tools/pollen"          "$BIN_DIR/pollen"
+cp "$SRC_DIR/tools/pollen-bench.sh" "$BIN_DIR/../share/pollen/pollen-bench.sh"
+mkdir -p "$BIN_DIR/../share/pollen"
+chmod +x "$BIN_DIR/pollen" "$SHARE_DIR/bin/pollen-node" "$SHARE_DIR/bin/pollen-client" \
+         "$BIN_DIR/../share/pollen/pollen-bench.sh"
 
 say "Installed:"
 echo "    $BIN_DIR/pollen"

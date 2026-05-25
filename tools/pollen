@@ -26,16 +26,23 @@ USAGE
     pollen <command> [args]
 
 COMMANDS
-    run [port]                    Start a UDP node (default port: 5000)
-                                  Pass 0 for an ephemeral port (printed at startup).
-    send <ip> <port> <payload>    One-shot send a UDP datagram, no ACK wait.
+    run [port] [--shared <dir>]   Start a UDP node (default port: 5000;
+                                  0 = ephemeral). --shared scans
+                                  topics/ + souscriptions/ from <dir>.
+    send <ip> <port> <payload>    Raw send a UDP datagram (no ACK wait).
+    send <ip> <port> <topic-uuid> <ver> <data-json>
+                                  Send a MESSAGE envelope + wait for ACK
+                                  (5 × 1 s retry).
+    bench [-k K] [-m M]           Load test: K publishers × M messages.
+                                  Reports throughput, retries, dedup.
+                                  Default K=4 M=100.
     version                       Print version + amc binding info.
     help                          This screen.
 
 ENVIRONMENT
-    POLLEN_NODE_BIN  Path to a pre-built pollen-node binary
-                     (defaults to the one shipped by install.sh in
-                     \$HOME/.local/share/pollen/bin/pollen-node).
+    POLLEN_NODE_BIN   Path to a pre-built pollen-node binary.
+    POLLEN_CLIENT_BIN Same for pollen-client.
+                     (defaults: \$HOME/.local/share/pollen/bin/…)
 EOF
 }
 
@@ -46,6 +53,70 @@ cmd_version() {
     else
         echo "amc: not on PATH"
     fi
+}
+
+# Build pollen-node from source if no installed/env binary exists.
+# Result lives in a stable cache dir so subsequent calls reuse it
+# instead of recompiling each time (handy for `pollen bench` which
+# spawns 1+K nodes — a fresh compile per call would dominate the
+# load-test budget).
+ensure_node_bin() {
+    local bin="${POLLEN_NODE_BIN:-$HOME/.local/share/pollen/bin/pollen-node}"
+    if [ -x "$bin" ]; then
+        echo "$bin"
+        return 0
+    fi
+    if [ ! -f "$SCRIPT_DIR/pollen-node.am" ]; then
+        echo "pollen: cannot find pollen-node binary (POLLEN_NODE_BIN=$bin)" >&2
+        return 2
+    fi
+    local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/pollen-dev"
+    bin="$cache_dir/pollen-node"
+    local src_mtime build_mtime
+    src_mtime=$(stat -c %Y "$SCRIPT_DIR/pollen-node.am" 2>/dev/null || echo 0)
+    build_mtime=$(stat -c %Y "$bin" 2>/dev/null || echo 0)
+    if [ -x "$bin" ] && [ "$build_mtime" -ge "$src_mtime" ]; then
+        echo "$bin"
+        return 0
+    fi
+    mkdir -p "$cache_dir"
+    local dt_base="$HOME/.amalgame/packages/github.com/amalgame-lang/amalgame-datetime"
+    local rnd_base="$HOME/.amalgame/packages/github.com/amalgame-lang/amalgame-random"
+    [ -d "$dt_base" ]  || { echo "pollen: amalgame-datetime missing — run 'amc package add datetime'" >&2; return 2; }
+    [ -d "$rnd_base" ] || { echo "pollen: amalgame-random missing — run 'amc package add random'" >&2; return 2; }
+    local amc_dir amc_runtime amc_stdlib
+    amc_dir="$(dirname "$(command -v amc)")"
+    if [ -d "$amc_dir/../share/amalgame/runtime" ]; then
+        amc_runtime="$amc_dir/../share/amalgame/runtime"
+        amc_stdlib="$amc_dir/../share/amalgame/stdlib"
+    else
+        amc_runtime="$amc_dir/runtime"
+        amc_stdlib="$amc_dir/src/stdlib"
+    fi
+    local dt_ver rnd_ver
+    dt_ver=$(ls -1 "$dt_base" 2>/dev/null | sort -V | tail -1)
+    rnd_ver=$(ls -1 "$rnd_base" 2>/dev/null | sort -V | tail -1)
+    local dt_facade="$dt_base/$dt_ver/facade.am"
+    local dt_lib="$dt_base/$dt_ver/build/linux-x86_64/libamalgame-pkg-DateTime.a"
+    local rnd_facade="$rnd_base/$rnd_ver/facade.am"
+    local rnd_lib="$rnd_base/$rnd_ver/build/linux-x86_64/libamalgame-pkg-Random.a"
+    echo "pollen: compiling pollen-node (cached at $bin)" >&2
+    # amc emits "Generated:" / "Build OK" lines on stdout even
+    # under --quiet — redirect to stderr so $(ensure_node_bin)
+    # captures only the final path. Same for gcc warnings.
+    (cd "$cache_dir" && amc -o pollen-node "$SCRIPT_DIR/pollen-node.am" "$amc_stdlib/json.am" "$dt_facade" "$rnd_facade" --quiet) 1>&2 \
+        || { echo "pollen: amc compile failed" >&2; return 2; }
+    local pkg_incs=""
+    for d in "$HOME"/.amalgame/packages/github.com/amalgame-lang/*/; do
+        [ -d "$d" ] || continue
+        local latest
+        latest=$(ls -1 "$d" 2>/dev/null | sort -V | tail -1)
+        [ -n "$latest" ] && pkg_incs="$pkg_incs -I$d$latest/runtime"
+    done
+    gcc -O2 -I"$amc_runtime" $pkg_incs "$cache_dir/pollen-node.c" "$dt_lib" "$rnd_lib" \
+        -lgc -lm -lz -ldl -lpthread -o "$bin" 1>&2 2>&1 \
+        || { echo "pollen: gcc link failed" >&2; return 2; }
+    echo "$bin"
 }
 
 cmd_run() {
@@ -161,9 +232,22 @@ EOF
     fi
 }
 
+cmd_bench() {
+    local bench="$SCRIPT_DIR/pollen-bench.sh"
+    if [ ! -f "$bench" ]; then
+        # Installed layout: pollen-bench.sh lives under share/pollen/.
+        bench="$(dirname "$SCRIPT_DIR")/share/pollen/pollen-bench.sh"
+    fi
+    [ -x "$bench" ] || { echo "pollen: pollen-bench.sh missing" >&2; exit 2; }
+    local node_bin
+    node_bin="$(ensure_node_bin)" || exit 2
+    exec "$bench" -b "$node_bin" "$@"
+}
+
 case "${1:-help}" in
     run)     shift; cmd_run     "$@" ;;
     send)    shift; cmd_send    "$@" ;;
+    bench)   shift; cmd_bench   "$@" ;;
     version) cmd_version ;;
     help|-h|--help) cmd_help ;;
     *)
