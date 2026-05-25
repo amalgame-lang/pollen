@@ -152,6 +152,201 @@ import Amalgame.String
         _pollen_self_port = port;
     }
 
+    /* ── Phase 4.5.2 — debug pause / phone-home ─────────────────
+     *
+     * When a MESSAGE arrives with a `debug` field and the local
+     * role matches the session's pause criteria (mode=step, or
+     * mode=breakpoint + role ∈ bp list, or hit_bp already true),
+     * this helper opens a synchronous TCP connection to the
+     * manager declared in the envelope, sends a DEBUG_PAUSE JSON
+     * line carrying the FULL incoming envelope, then blocks on
+     * recv waiting for a single response line. Returns the parsed
+     * command code.
+     *
+     * The connection is one-shot per hop : 1 connect + 1 send +
+     * 1 recv + close. We don't keep it warm across hops because
+     * each hop runs in a different worker thread of a different
+     * node, possibly on a different host.
+     *
+     * Timeouts :
+     *   connect : 3 s   (fail fast if manager is down)
+     *   recv    : 60 s  (operator-paced step ; 0 = TIMEOUT → CANCEL)
+     */
+    #include <errno.h>
+    #include <sys/time.h>
+
+    #define POLLEN_DBG_STEP_OVER  0
+    #define POLLEN_DBG_STEP_INTO  1
+    #define POLLEN_DBG_CONTINUE   2
+    #define POLLEN_DBG_CANCEL     3
+    #define POLLEN_DBG_MUTATE     4
+    #define POLLEN_DBG_TIMEOUT    5
+    #define POLLEN_DBG_NO_CONN    6
+    #define POLLEN_DBG_NO_PAUSE   7   /* internal — don't pause at all */
+
+    static int _pollen_debug_pause(
+            const char* envelope, size_t envelope_len,
+            const char* manager_host_port,    /* NUL-terminated */
+            const char* session_str,           /* NUL-terminated */
+            const char* role
+    ) {
+        /* host:port split */
+        char host[64];
+        const char* colon = strchr(manager_host_port, ':');
+        if (!colon) return POLLEN_DBG_NO_CONN;
+        size_t hlen = (size_t)(colon - manager_host_port);
+        if (hlen == 0 || hlen >= sizeof(host)) return POLLEN_DBG_NO_CONN;
+        memcpy(host, manager_host_port, hlen);
+        host[hlen] = 0;
+        int port = atoi(colon + 1);
+        if (port <= 0 || port > 65535) return POLLEN_DBG_NO_CONN;
+
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return POLLEN_DBG_NO_CONN;
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons((uint16_t) port);
+        if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+            close(fd); return POLLEN_DBG_NO_CONN;
+        }
+        /* 3s send timeout so connect doesn't hang forever */
+        struct timeval ctv = { 3, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof(ctv));
+        if (connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
+            close(fd); return POLLEN_DBG_NO_CONN;
+        }
+
+        /* Compose + send the DEBUG_PAUSE JSON :
+         *   {"type":"DEBUG_PAUSE","session":"...","role":"...",
+         *    "envelope":<incoming envelope verbatim>}
+         * The envelope is already valid JSON so it splices in. */
+        char header[256];
+        int hn = snprintf(header, sizeof(header),
+            "{\"type\":\"DEBUG_PAUSE\",\"session\":\"%s\","
+            "\"role\":\"%s\",\"envelope\":",
+            session_str, role);
+        if (hn <= 0 || hn >= (int) sizeof(header)) {
+            close(fd); return POLLEN_DBG_NO_CONN;
+        }
+        if (send(fd, header, (size_t) hn, MSG_NOSIGNAL) != hn) {
+            close(fd); return POLLEN_DBG_NO_CONN;
+        }
+        if (send(fd, envelope, envelope_len, MSG_NOSIGNAL) != (ssize_t) envelope_len) {
+            close(fd); return POLLEN_DBG_NO_CONN;
+        }
+        const char* tail = "}\n";
+        send(fd, tail, 2, MSG_NOSIGNAL);
+
+        /* Block on response with 60s recv timeout. */
+        struct timeval rtv = { 60, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+
+        char rbuf[1024];
+        ssize_t got = 0;
+        ssize_t r;
+        while (got < (ssize_t) sizeof(rbuf) - 1) {
+            r = recv(fd, rbuf + got, sizeof(rbuf) - 1 - got, 0);
+            if (r <= 0) break;
+            got += r;
+            /* Stop as soon as we have a complete line. */
+            if (memchr(rbuf, '\n', got)) break;
+        }
+        close(fd);
+        if (got <= 0) return POLLEN_DBG_TIMEOUT;
+        rbuf[got] = 0;
+
+        /* Type-field naive match. The manager only sends one of
+         * a small fixed vocabulary. */
+        if (strstr(rbuf, "\"DEBUG_STEP_OVER\""))  return POLLEN_DBG_STEP_OVER;
+        if (strstr(rbuf, "\"DEBUG_STEP_INTO\""))  return POLLEN_DBG_STEP_INTO;
+        if (strstr(rbuf, "\"DEBUG_STEP\""))       return POLLEN_DBG_STEP_INTO;
+        if (strstr(rbuf, "\"DEBUG_CONTINUE\""))   return POLLEN_DBG_CONTINUE;
+        if (strstr(rbuf, "\"DEBUG_CANCEL\""))     return POLLEN_DBG_CANCEL;
+        if (strstr(rbuf, "\"DEBUG_MUTATE\""))     return POLLEN_DBG_MUTATE;
+        return POLLEN_DBG_TIMEOUT;
+    }
+
+    /* Decide whether this node should pause for an incoming debug
+     * envelope. Extracts mode + hit_bp + breakpoints from the
+     * envelope and matches against the local role.
+     *   POLLEN_DBG_NO_PAUSE   → don't pause, forward normally
+     *   POLLEN_DBG_STEP_INTO  → pause (rolled into a single
+     *                            "should pause" return — the
+     *                            actual command is decided by the
+     *                            manager response). Re-using a code
+     *                            value is fine ; the caller checks
+     *                            with `!= NO_PAUSE`.
+     */
+    static int _pollen_debug_should_pause(
+            const char* envelope, size_t envelope_len,
+            const char* self_role
+    ) {
+        const char* MODE_KEY = "\"debug\":{\"session\":\"";
+        const char* d = _pollen_find(envelope, envelope_len, MODE_KEY, 20);
+        if (!d) return POLLEN_DBG_NO_PAUSE;
+
+        /* Look for "hit_bp":true within the debug field — anywhere
+         * later in the envelope is fine since debug is the last
+         * field of an envelope from our publisher. */
+        const char* hit = _pollen_find(envelope, envelope_len,
+            "\"hit_bp\":true", 13);
+        if (hit) return POLLEN_DBG_STEP_INTO;  /* sticky once tripped */
+
+        /* mode lookup */
+        const char* mk = _pollen_find(envelope, envelope_len,
+            "\"mode\":\"", 8);
+        if (!mk) return POLLEN_DBG_NO_PAUSE;
+        const char* mv = mk + 8;
+        const char* mq = memchr(mv, '"',
+            envelope_len - (size_t)(mv - envelope));
+        if (!mq) return POLLEN_DBG_NO_PAUSE;
+        size_t mlen = (size_t)(mq - mv);
+        int is_step = (mlen == 4 && memcmp(mv, "step", 4) == 0);
+        int is_bp   = (mlen == 10 && memcmp(mv, "breakpoint", 10) == 0);
+
+        if (is_step) return POLLEN_DBG_STEP_INTO;
+        if (!is_bp)  return POLLEN_DBG_NO_PAUSE;
+
+        /* mode=breakpoint : check if our role appears in the
+         * breakpoints array. Heuristic : look for `"role":"<self>"`
+         * after the `"breakpoints":[` marker. Good enough since
+         * the envelope doesn't have any other `"role":` field on
+         * the producer side. */
+        const char* bps = _pollen_find(envelope, envelope_len,
+            "\"breakpoints\":[", 15);
+        if (!bps) return POLLEN_DBG_NO_PAUSE;
+        char needle[80];
+        int nlen = snprintf(needle, sizeof(needle),
+            "\"role\":\"%s\"", self_role);
+        if (nlen <= 0 || nlen >= (int) sizeof(needle)) return POLLEN_DBG_NO_PAUSE;
+        size_t after_off = (size_t)(bps - envelope);
+        const char* hit2 = _pollen_find(envelope + after_off,
+            envelope_len - after_off, needle, (size_t) nlen);
+        return hit2 ? POLLEN_DBG_STEP_INTO : POLLEN_DBG_NO_PAUSE;
+    }
+
+    /* Extract `"debug":{...,"manager":"<host:port>",...}` into a
+     * NUL-terminated buffer. Returns 1 on success, 0 if not found. */
+    static int _pollen_debug_extract_manager(
+            const char* envelope, size_t envelope_len,
+            char* out, size_t out_cap
+    ) {
+        const char* m = _pollen_find(envelope, envelope_len,
+            "\"manager\":\"", 11);
+        if (!m) return 0;
+        const char* v = m + 11;
+        const char* q = memchr(v, '"',
+            envelope_len - (size_t)(v - envelope));
+        if (!q) return 0;
+        size_t vlen = (size_t)(q - v);
+        if (vlen == 0 || vlen >= out_cap) return 0;
+        memcpy(out, v, vlen);
+        out[vlen] = 0;
+        return 1;
+    }
+
     /* Write one execution step record. All string args are length-
      * delimited so callers can pass pointers into the recv buffer
      * without NUL-terminating. parent_mid may be NULL (root step).
@@ -753,6 +948,71 @@ import Amalgame.String
                                     dbg_session_len = (size_t)(dq - dbg_session);
                                 }
                             }
+
+                            /* Phase 4.5.2 — debug pause / phone-home.
+                             * Only fires when the envelope carries a
+                             * debug session AND the local role matches
+                             * the session's pause criteria. CANCEL /
+                             * TIMEOUT / NO_CONN → drop the message,
+                             * skip forward + record. STEP_* / CONTINUE
+                             * → fall through to the normal forward
+                             * path (mode rewriting is Phase 4.5.4). */
+                            int dbg_dropped = 0;
+                            if (dbg_session && dbg_session_len > 0) {
+                                int should = _pollen_debug_should_pause(
+                                    rbuf, line_len, _pollen_self_role);
+                                if (should != POLLEN_DBG_NO_PAUSE) {
+                                    char mgr[96];
+                                    char sess[64];
+                                    int have_mgr = _pollen_debug_extract_manager(
+                                        rbuf, line_len, mgr, sizeof(mgr));
+                                    int sess_ok = dbg_session_len < sizeof(sess);
+                                    if (have_mgr && sess_ok) {
+                                        memcpy(sess, dbg_session, dbg_session_len);
+                                        sess[dbg_session_len] = 0;
+                                        fprintf(stdout,
+                                            "debug: pause at role=%s session=%s manager=%s\n",
+                                            _pollen_self_role, sess, mgr);
+                                        fflush(stdout);
+                                        int cmd = _pollen_debug_pause(
+                                            rbuf, line_len, mgr, sess,
+                                            _pollen_self_role);
+                                        const char* cmd_name = "?";
+                                        switch (cmd) {
+                                            case POLLEN_DBG_STEP_OVER: cmd_name = "STEP_OVER"; break;
+                                            case POLLEN_DBG_STEP_INTO: cmd_name = "STEP_INTO"; break;
+                                            case POLLEN_DBG_CONTINUE:  cmd_name = "CONTINUE";  break;
+                                            case POLLEN_DBG_CANCEL:    cmd_name = "CANCEL";    break;
+                                            case POLLEN_DBG_MUTATE:    cmd_name = "MUTATE";    break;
+                                            case POLLEN_DBG_TIMEOUT:   cmd_name = "TIMEOUT";   break;
+                                            case POLLEN_DBG_NO_CONN:   cmd_name = "NO_CONN";   break;
+                                        }
+                                        fprintf(stdout,
+                                            "debug: resume at role=%s cmd=%s\n",
+                                            _pollen_self_role, cmd_name);
+                                        fflush(stdout);
+                                        if (cmd == POLLEN_DBG_CANCEL
+                                            || cmd == POLLEN_DBG_TIMEOUT
+                                            || cmd == POLLEN_DBG_NO_CONN) {
+                                            dbg_dropped = 1;
+                                        }
+                                        /* STEP_OVER / STEP_INTO / CONTINUE
+                                         * fall through to the normal forward
+                                         * path. MUTATE is Phase 4.5.6. */
+                                    } else {
+                                        fprintf(stdout,
+                                            "debug: pause requested but bad envelope (have_mgr=%d sess_ok=%d) at role=%s\n",
+                                            have_mgr, sess_ok, _pollen_self_role);
+                                        fflush(stdout);
+                                    }
+                                }
+                            }
+                            if (dbg_dropped) {
+                                /* Skip forward + record. The msg ACK
+                                 * has already gone upstream, so the
+                                 * producer thinks delivery is done. */
+                            } else {
+
                             char fwd_new_mid[37] = {0};
                             if (_pollen_wf_n_nexts > 0) {
                                 _pollen_wf_forward_all(rbuf, line_len,
@@ -821,6 +1081,7 @@ import Amalgame.String
                                     dbg_session, dbg_session_len);
                             }
                             fflush(stdout);
+                            }  /* end else { ... } of dbg_dropped */
                         }
                     }
                 }
