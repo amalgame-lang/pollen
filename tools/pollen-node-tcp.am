@@ -1,20 +1,22 @@
-// Pollen — TCP node daemon (v0.2.0-dev, Phase 2.0)
+// Pollen — TCP node daemon (v0.2.0-dev, Phase 2.1)
 //
-// First TCP transport iteration. Replaces UDP's retry/dedup/SO_RCVBUF
-// machinery with kernel-level TCP reliability. The wire format stays
-// the same JSON envelope shape, but the architecture changes:
+// TCP transport with long-lived connections + newline-delimited
+// JSON framing. Replaces UDP's retry/dedup/SO_RCVBUF machinery
+// with kernel-level TCP reliability.
 //
-//   - One connection per MESSAGE (request/response style).
-//     Phase 2.1 will add long-lived connections + framing.
-//   - No app-level ACK retry (TCP retransmits).
-//   - No UUID dedup cache (TCP ordered, no in-stream duplicates).
-//   - No pendingMessages list (delivery is synchronous within a
-//     connect-send-recv-close cycle).
+//   - One connection per peer pair (long-lived, multiple MSGs flow).
+//   - Wire framing: each JSON envelope is terminated by '\n'. The
+//     client/server buffer raw recv chunks and split on '\n' to
+//     extract complete envelopes; partial trailing bytes stay in
+//     the buffer for the next recv.
+//   - No app-level ACK retry: TCP retransmits at the kernel.
+//   - No UUID dedup cache: TCP ordered, no in-stream duplicates.
+//   - No pendingMessages list: synchronous within a connection.
 //
-// Wire format per connection:
-//   client → server: <JSON envelope, MESSAGE shape>
-//   server → client: <JSON envelope, ACK shape>
-//   close
+// Wire per connection:
+//   client → server: <JSON MSG>\n<JSON MSG>\n…
+//   server → client: <JSON ACK>\n<JSON ACK>\n…
+//   either side closes on EOF; the other detects via null recv.
 //
 // Usage:
 //   pollen-node-tcp 5000                          # listen on :5000
@@ -104,64 +106,79 @@ public class Program {
         return shortId + " v" + String_FromInt(version)
     }
 
-    // ── publish: connect, send envelope, recv ACK, close ──
+    // ── publish stream: one TCP connection, many MESSAGE→ACK pairs
     //
-    // Returns true on ACK match, false on any failure. No retry —
-    // caller can decide to reconnect. TCP handles the kernel-level
-    // retransmission automatically up to its own timeout (~tens of
-    // seconds on Linux), which is much more conservative than our
-    // UDP 5×1s retry — but for LAN traffic the typical case is
-    // "either it connects fast or it never will" so this is fine.
+    // Opens a single TCP conn to peerIp:peerPort, fires N publishes
+    // back-to-back (each MSG\n then read ACK\n) on the same socket.
+    // Closes when done. ackBuf carries partial bytes between recv
+    // chunks (TCP doesn't preserve message boundaries; a single
+    // recv() may return part of one ACK, a full ACK, or several
+    // ACKs concatenated).
+    //
+    // Returns the count of MESSAGEs whose ACK matched. Mismatched
+    // ACKs are logged but don't abort the stream — caller can
+    // decide whether the partial success counts.
 
-    public static bool PublishOne(string peerIp, int peerPort,
-                                   string topicUuid, int topicVersion,
-                                   string dataJson) {
-        let mid:  string = Program.UuidV4()
-        let now:  int    = Program.NowMs()
-        let body: string = Program.EncodeMessage(topicUuid, topicVersion,
-                                                  dataJson, mid, now)
-        Console.WriteLine("publish {mid} to {peerIp}:{peerPort} topic={topicUuid} v{topicVersion} ts={now}")
-        Console.Flush()
-
+    public static int PublishStream(string peerIp, int peerPort,
+                                     string topicUuid, int topicVersion,
+                                     string dataJson, int count) {
         let cli = TcpClient_Connect(peerIp, peerPort)
         if (!cli.Connected) {
-            Console.WriteLine("publish FAILED {mid} to {peerIp}:{peerPort} (connect refused)")
+            Console.WriteLine("publish-stream FAILED to {peerIp}:{peerPort} (connect refused)")
             Console.Flush()
-            return false
+            return 0
         }
-        // amc resolver mis-declares TcpClient_Send as void (the C
-        // impl returns code_bool). Can't capture the return — rely
-        // on the post-recv check below to surface a broken connect.
-        TcpClient_Send(cli, body)
-        // 32 KiB buffer for the inbound ACK — way more than our ACK
-        // envelope (under 200 bytes) but covers future extensions.
-        let respStr: string = TcpClient_Receive(cli, 32768)
+        var ackBuf: string = ""
+        var done: int = 0
+        var idx: int = 0
+        while (idx < count) {
+            let mid:  string = Program.UuidV4()
+            let now:  int    = Program.NowMs()
+            let body: string = Program.EncodeMessage(topicUuid, topicVersion,
+                                                      dataJson, mid, now)
+            // amc resolver bug: TcpClient_Send declared void but C
+            // returns code_bool — can't capture. Rely on the recv
+            // path to surface broken sockets.
+            TcpClient_Send(cli, body + "\n")
+            Console.WriteLine("publish {mid} to {peerIp}:{peerPort} topic={topicUuid} v{topicVersion} ts={now}")
+            // Read until we have a full line in ackBuf.
+            var nlPos: int = String_IndexOf(ackBuf, "\n")
+            while (nlPos < 0) {
+                let chunk: string = TcpClient_Receive(cli, 4096)
+                if (chunk == null) {
+                    Console.WriteLine("publish-stream EOF mid-ACK at idx={idx}")
+                    Console.Flush()
+                    TcpClient_Close(cli)
+                    return done
+                }
+                ackBuf = ackBuf + chunk
+                nlPos = String_IndexOf(ackBuf, "\n")
+            }
+            let line: string = String_Substring(ackBuf, 0, nlPos)
+            let rest: int    = String_Length(ackBuf) - nlPos - 1
+            ackBuf = String_Substring(ackBuf, nlPos + 1, rest)
+            let parser: JsonParser = new JsonParser(line)
+            let v: JsonValue       = parser.ParseTopLevel()
+            if (parser.HasFailed()) {
+                Console.WriteLine("publish FAILED {mid} (ACK JSON parse: {parser.ErrorMsg()})")
+            } else {
+                let tV: JsonValue = v.Get("type")
+                let mV: JsonValue = v.Get("messageId")
+                let tS: string = tV.AsString()
+                let mS: string = mV.AsString()
+                let ackNow: int = Program.NowMs()
+                if (tS == "ACK" && mS == mid) {
+                    Console.WriteLine("recv ACK from {peerIp}:{peerPort} for {mid} (publish complete) ts={ackNow}")
+                    done = done + 1
+                } else {
+                    Console.WriteLine("publish FAILED {mid} (ACK mismatch: type={tS} mid={mS})")
+                }
+            }
+            Console.Flush()
+            idx = idx + 1
+        }
         TcpClient_Close(cli)
-        if (respStr == null) {
-            Console.WriteLine("publish FAILED {mid} to {peerIp}:{peerPort} (peer hung up before ACK)")
-            Console.Flush()
-            return false
-        }
-        let parser: JsonParser = new JsonParser(respStr)
-        let v: JsonValue       = parser.ParseTopLevel()
-        if (parser.HasFailed()) {
-            Console.WriteLine("publish FAILED {mid} to {peerIp}:{peerPort} (ACK JSON parse: {parser.ErrorMsg()})")
-            Console.Flush()
-            return false
-        }
-        let tV: JsonValue = v.Get("type")
-        let mV: JsonValue = v.Get("messageId")
-        let tS: string = tV.AsString()
-        let mS: string = mV.AsString()
-        let ackNow: int = Program.NowMs()
-        if (tS == "ACK" && mS == mid) {
-            Console.WriteLine("recv ACK from {peerIp}:{peerPort} for {mid} (publish complete) ts={ackNow}")
-            Console.Flush()
-            return true
-        }
-        Console.WriteLine("publish FAILED {mid} to {peerIp}:{peerPort} (ACK mismatch: type={tS} mid={mS})")
-        Console.Flush()
-        return false
+        return done
     }
 
     // Server-side connection handling is inlined in Main's accept
@@ -215,13 +232,23 @@ public class Program {
         } else {
             Console.WriteLine("pollen-node-tcp: listening on TCP :{actualPort}")
         }
-        Console.WriteLine("pollen-node-tcp: wire = JSON, transport = TCP request/response (v0.2.0-dev)")
+        Console.WriteLine("pollen-node-tcp: wire = JSON\\n-delim, transport = long-lived TCP (v0.2.0-dev Phase 2.1)")
         Console.Flush()
 
-        // Startup-time publishes (fire-and-wait-ACK once per spec).
+        // Startup-time publishes. All specs that target the same
+        // ip:port stream over a single TCP connection — TCP handshake
+        // is paid once per peer, not once per MESSAGE.
         if (String_Length(publishSpec) > 0) {
             let specs: List<string> = String_Split(publishSpec, ";")
             let m: int = specs.Count()
+            // First pass: parse all specs into parallel lists, group
+            // by peer in a single pass (good enough for small spec
+            // counts; the bench uses one peer per publisher).
+            let ips:   List<string> = new List<string>()
+            let ports: List<int>    = new List<int>()
+            let uuids: List<string> = new List<string>()
+            let vers:  List<int>    = new List<int>()
+            let datas: List<string> = new List<string>()
             for si in 0..m {
                 let spec: string = specs.Get(si)
                 if (String_Length(spec) == 0) { continue }
@@ -240,15 +267,99 @@ public class Program {
                     pData = pData + ":" + parts.Get(pj)
                     pj = pj + 1
                 }
-                Program.PublishOne(pIp, pPort, pUuid, pVer, pData)
+                ips.Add(pIp); ports.Add(pPort)
+                uuids.Add(pUuid); vers.Add(pVer); datas.Add(pData)
             }
-            Console.Flush()
+            // Second pass: open a conn for each distinct peer, stream
+            // every MSG that targets it. The bench typically has all
+            // K=N specs hit the same receiver so we open 1 conn and
+            // fire M MSGs — the natural HTTP/1.1 keep-alive pattern.
+            let n: int = ips.Count()
+            var i: int = 0
+            while (i < n) {
+                let pIp: string = ips.Get(i)
+                let pPort: int  = ports.Get(i)
+                // collect indices for this peer
+                let group: List<int> = new List<int>()
+                var j: int = i
+                while (j < n) {
+                    if (ips.Get(j) == pIp && ports.Get(j) == pPort) {
+                        group.Add(j)
+                    }
+                    j = j + 1
+                }
+                // open + stream
+                let cli = TcpClient_Connect(pIp, pPort)
+                if (!cli.Connected) {
+                    Console.WriteLine("publish-stream FAILED to {pIp}:{pPort} (connect refused)")
+                    Console.Flush()
+                } else {
+                    var ackBuf: string = ""
+                    let gn: int = group.Count()
+                    for gi in 0..gn {
+                        let idx: int = group.Get(gi)
+                        let pUuid: string = uuids.Get(idx)
+                        let pVer:  int    = vers.Get(idx)
+                        let pData: string = datas.Get(idx)
+                        let mid:   string = Program.UuidV4()
+                        let now:   int    = Program.NowMs()
+                        let body:  string = Program.EncodeMessage(pUuid, pVer, pData, mid, now)
+                        TcpClient_Send(cli, body + "\n")
+                        Console.WriteLine("publish {mid} to {pIp}:{pPort} topic={pUuid} v{pVer} ts={now}")
+                        // Drain one ACK line
+                        var nlPos: int = String_IndexOf(ackBuf, "\n")
+                        while (nlPos < 0) {
+                            let chunk: string = TcpClient_Receive(cli, 4096)
+                            if (chunk == null) {
+                                Console.WriteLine("publish-stream EOF mid-ACK for {mid}")
+                                Console.Flush()
+                                break
+                            }
+                            ackBuf = ackBuf + chunk
+                            nlPos = String_IndexOf(ackBuf, "\n")
+                        }
+                        if (nlPos < 0) {
+                            Console.Flush()
+                            break
+                        }
+                        let line: string = String_Substring(ackBuf, 0, nlPos)
+                        let rest: int    = String_Length(ackBuf) - nlPos - 1
+                        ackBuf = String_Substring(ackBuf, nlPos + 1, rest)
+                        let parser: JsonParser = new JsonParser(line)
+                        let v: JsonValue       = parser.ParseTopLevel()
+                        let ackNow: int = Program.NowMs()
+                        if (parser.HasFailed()) {
+                            Console.WriteLine("publish FAILED {mid} (ACK JSON parse)")
+                        } else {
+                            let tV: JsonValue = v.Get("type")
+                            let mV: JsonValue = v.Get("messageId")
+                            let tS: string = tV.AsString()
+                            let mS: string = mV.AsString()
+                            if (tS == "ACK" && mS == mid) {
+                                Console.WriteLine("recv ACK from {pIp}:{pPort} for {mid} (publish complete) ts={ackNow}")
+                            } else {
+                                Console.WriteLine("publish FAILED {mid} (ACK mismatch type={tS} mid={mS})")
+                            }
+                        }
+                        Console.Flush()
+                    }
+                    TcpClient_Close(cli)
+                }
+                // Advance i past all entries in this group
+                i = i + 1
+                while (i < n && ips.Get(i) == pIp && ports.Get(i) == pPort) {
+                    i = i + 1
+                }
+            }
         }
 
-        // Accept loop. Single-threaded for Phase 2.0 — every accept
-        // serially handled. Phase 2.1 spawns a worker thread per
-        // accept via amalgame-threading to lift the K-publisher
-        // concurrency ceiling.
+        // Server accept loop. Each accepted conn is long-lived: we
+        // loop on TcpConn_Receive, buffer chunks, split on '\n',
+        // process each complete line. Null recv = peer closed → we
+        // close our end and go back to accept.
+        //
+        // Still single-thread: K publishers serialise here. Phase 2.2
+        // spawns a worker thread per accept via amalgame-threading.
         while (true) {
             let conn = TcpServer_Accept(server)
             if (!conn.Connected) {
@@ -256,64 +367,63 @@ public class Program {
             }
             let fromIp:   string = conn.RemoteIp
             let fromPort: int    = conn.RemotePort
-            let payload:  string = TcpConn_Receive(conn, 65536)
-            if (payload == null) {
-                TcpConn_Close(conn)
-                continue
-            }
-            let plen: int = String_Length(payload)
-
-            let parser: JsonParser = new JsonParser(payload)
-            let env: JsonValue     = parser.ParseTopLevel()
-            if (parser.HasFailed()) {
-                let pmsg: string = parser.ErrorMsg()
-                Console.WriteLine("recv {plen} bytes from {fromIp}:{fromPort} — JSON parse failed: {pmsg}")
-                Console.Flush()
-                TcpConn_Close(conn)
-                continue
-            }
-            if (!env.IsObject()) {
-                Console.WriteLine("recv {plen} bytes from {fromIp}:{fromPort} — envelope not an object")
-                Console.Flush()
-                TcpConn_Close(conn)
-                continue
-            }
-            let typeV: JsonValue = env.Get("type")
-            let mtype: string = typeV.AsString()
-
-            if (mtype == "MESSAGE") {
-                let midV: JsonValue = env.Get("messageId")
-                let mid: string = midV.AsString()
-                if (String_Length(mid) == 0) {
-                    Console.WriteLine("recv MESSAGE from {fromIp}:{fromPort} — missing messageId, dropping")
-                    Console.Flush()
-                    TcpConn_Close(conn)
+            var rbuf: string = ""
+            var closed: bool = false
+            while (!closed) {
+                let chunk: string = TcpConn_Receive(conn, 8192)
+                if (chunk == null) {
+                    closed = true
                     continue
                 }
-                let topicV: JsonValue = env.Get("topic")
-                let topicSum: string = Program.TopicSummary(topicV)
-                let now: int = Program.NowMs()
-                Console.WriteLine("recv MESSAGE {mid} topic={topicSum} from {fromIp}:{fromPort} bytes={plen}")
-                let ackBody: string = Program.EncodeAck(mid, now)
-                TcpConn_Send(conn, ackBody)
-                Console.Flush()
-                TcpConn_Close(conn)
-                continue
+                rbuf = rbuf + chunk
+                // Drain all complete lines in rbuf
+                var nlPos: int = String_IndexOf(rbuf, "\n")
+                while (nlPos >= 0) {
+                    let line: string = String_Substring(rbuf, 0, nlPos)
+                    let rest: int    = String_Length(rbuf) - nlPos - 1
+                    rbuf = String_Substring(rbuf, nlPos + 1, rest)
+                    let plen: int = String_Length(line)
+                    let parser: JsonParser = new JsonParser(line)
+                    let env: JsonValue     = parser.ParseTopLevel()
+                    if (parser.HasFailed()) {
+                        let pmsg: string = parser.ErrorMsg()
+                        Console.WriteLine("recv {plen} bytes from {fromIp}:{fromPort} — JSON parse failed: {pmsg}")
+                    } else {
+                        if (!env.IsObject()) {
+                            Console.WriteLine("recv {plen} bytes from {fromIp}:{fromPort} — envelope not an object")
+                        } else {
+                            let typeV: JsonValue = env.Get("type")
+                            let mtype: string = typeV.AsString()
+                            if (mtype == "MESSAGE") {
+                                let midV: JsonValue = env.Get("messageId")
+                                let mid: string = midV.AsString()
+                                if (String_Length(mid) == 0) {
+                                    Console.WriteLine("recv MESSAGE from {fromIp}:{fromPort} — missing messageId, dropping")
+                                } else {
+                                    let topicV: JsonValue = env.Get("topic")
+                                    let topicSum: string = Program.TopicSummary(topicV)
+                                    let now: int = Program.NowMs()
+                                    Console.WriteLine("recv MESSAGE {mid} topic={topicSum} from {fromIp}:{fromPort} bytes={plen}")
+                                    let ackBody: string = Program.EncodeAck(mid, now)
+                                    TcpConn_Send(conn, ackBody + "\n")
+                                }
+                            } else {
+                                if (mtype == "SYNCHRONIZATION") {
+                                    let etV: JsonValue = env.Get("entityType")
+                                    let euV: JsonValue = env.Get("uuid")
+                                    let et: string = etV.AsString()
+                                    let eu: string = euV.AsString()
+                                    Console.WriteLine("recv SYNC from {fromIp}:{fromPort} {et}={eu}")
+                                } else {
+                                    Console.WriteLine("recv unknown type='{mtype}' from {fromIp}:{fromPort} — dropping")
+                                }
+                            }
+                        }
+                    }
+                    Console.Flush()
+                    nlPos = String_IndexOf(rbuf, "\n")
+                }
             }
-
-            if (mtype == "SYNCHRONIZATION") {
-                let etV: JsonValue = env.Get("entityType")
-                let euV: JsonValue = env.Get("uuid")
-                let et: string = etV.AsString()
-                let eu: string = euV.AsString()
-                Console.WriteLine("recv SYNC from {fromIp}:{fromPort} {et}={eu}")
-                Console.Flush()
-                TcpConn_Close(conn)
-                continue
-            }
-
-            Console.WriteLine("recv unknown type='{mtype}' from {fromIp}:{fromPort} — dropping")
-            Console.Flush()
             TcpConn_Close(conn)
         }
     }
