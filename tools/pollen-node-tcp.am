@@ -1488,7 +1488,7 @@ public class Program {
                 return
             }
             if (a == "--debug") {
-                if (i + 1 < Args_Count()) {
+                if (i + 1 < Args_Count() && !String_StartsWith(Args_Get(i + 1), "--")) {
                     debugMode = Args_Get(i + 1)
                     i = i + 2
                     continue
@@ -1497,16 +1497,16 @@ public class Program {
                 return
             }
             if (a == "--debug-session") {
-                if (i + 1 < Args_Count()) {
+                if (i + 1 < Args_Count() && !String_StartsWith(Args_Get(i + 1), "--")) {
                     debugSession = Args_Get(i + 1)
                     i = i + 2
                     continue
                 }
-                Console.WriteLine("pollen-node-tcp: --debug-session needs a uuid")
+                Console.WriteLine("pollen-node-tcp: --debug-session needs a non-empty value (got next flag instead — maybe $(uuidgen) returned empty?)")
                 return
             }
             if (a == "--debug-manager") {
-                if (i + 1 < Args_Count()) {
+                if (i + 1 < Args_Count() && !String_StartsWith(Args_Get(i + 1), "--")) {
                     debugManager = Args_Get(i + 1)
                     i = i + 2
                     continue
@@ -1515,7 +1515,7 @@ public class Program {
                 return
             }
             if (a == "--debug-bp") {
-                if (i + 1 < Args_Count()) {
+                if (i + 1 < Args_Count() && !String_StartsWith(Args_Get(i + 1), "--")) {
                     debugBps = Args_Get(i + 1)
                     i = i + 2
                     continue
@@ -1860,8 +1860,14 @@ public class Program {
                     if (String_Length(debugMode) > 0) {
                         let dj: string = Program.BuildDebugJson(
                             debugMode, debugSession, debugManager, debugBps)
+                        // --publish data is a raw positional string ;
+                        // wrap it as a JSON string so the envelope is
+                        // valid for the Manager UI to parse. Bench
+                        // path (no --debug) keeps the raw splice for
+                        // perf.
+                        let dataQuoted: string = "\"" + Json.EscapeString(firstData) + "\""
                         Program.PublishStream(pIp, pPort, gTopic, gVer,
-                                              firstData, gn, dj)
+                                              dataQuoted, gn, dj)
                     } else {
                         // Pass first data verbatim. Per-iter variance
                         // costs an AM substring-search at startup that
