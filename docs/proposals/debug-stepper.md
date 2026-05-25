@@ -87,17 +87,21 @@ pauser (selon le mode + bp list), il :
      "treePath":  "..."           // si Phase 5 tree shipped
    }
    ```
-4. **Bloque** en attente d'une ligne de réponse du Manager :
-   - `{"type":"DEBUG_STEP"}` → forward au prochain hop, repause si
-     le mode l'exige.
-   - `{"type":"DEBUG_CONTINUE"}` → forward et désactive le debug
-     pour ce message (les hops downstream redeviennent normaux).
-   - `{"type":"DEBUG_MUTATE","data":{...}}` → réécrit `msg.data`
-     avec le nouveau payload avant de forward. Permet à
-     l'opérateur de réinjecter avec un état modifié.
-   - `{"type":"DEBUG_CANCEL"}` → drop le message, ne forward pas.
-   - timeout (default 60s) → assume `CANCEL`, log la perte.
-5. **Resume** : selon la réponse, forward ou drop.
+4. **Bloque** en attente d'une ligne de réponse du Manager. 5 commandes
+   inspirées des debuggers IDE (gdb/lldb/VS Code) :
+
+   | Wire command | Shortcut | Sémantique |
+   |---|---|---|
+   | `DEBUG_CONTINUE` | **F5** | Forward et propage `debug.mode="breakpoint"` avec la bp list, `hit_bp=false`. Downstream tourne normalement jusqu'au prochain breakpoint (ou fin du chain). |
+   | `DEBUG_STEP_OVER` | **F10** | Forward et propage `debug.mode="step"` POUR L'IMMÉDIAT NEXT HOP seulement. En Phase 5+ avec sub-trees, traite un `call` à un sub-workflow comme atomique (ne rentre pas dedans). |
+   | `DEBUG_STEP_INTO` | **F11** | Forward et propage `debug.mode="step"` pour tous les hops downstream. En Phase 5+, entre dans les sub-trees. Sur DAG plat Phase 4.5 = équivalent à STEP_OVER. |
+   | `DEBUG_STEP_OUT` | **Shift+F11** | (Phase 5+, sub-trees seulement) Continue jusqu'à sortir du sub-tree courant. Sur DAG plat = équivalent à CONTINUE. |
+   | `DEBUG_MUTATE` | — | `{type:"DEBUG_MUTATE","data":{…},"then":"step_over"\|"continue"}` Réécrit `msg.data` avec le nouveau payload, puis applique l'action `then`. |
+   | `DEBUG_CANCEL` | Esc | Drop le message, ne forward pas. |
+   | (timeout 60s) | — | Assume `CANCEL`, log la perte. |
+
+5. **Resume** : selon la commande, forge l'envelope sortant
+   (avec le bon `debug.mode` propagé) et forward au prochain hop.
 
 Côté Manager :
 - Endpoint `/api/debug/listen` : un TCP serveur (port séparé de
@@ -213,9 +217,26 @@ est active. Sous le DAG, à côté du panel Live :
 │ │   data:     { "value": 42, "ts": ... }      │  │
 │ │   [Edit data]                               │  │
 │ └────────────────────────────────────────────┘  │
-│ [ Step ] [ Continue ] [ Cancel ]                │
+│ [▶ Continue F5] [⇣ Step Over F10] [⇩ Step Into F11]  │
+│ [⇧ Step Out ⇧F11] [✎ Mutate] [✕ Cancel Esc]      │
 └─────────────────────────────────────────────────┘
 ```
+
+**Keyboard shortcuts** (UI-side, captured globally when a session
+is active and the browser tab has focus) :
+
+| Key | Action |
+|---|---|
+| **F5** | Continue (DEBUG_CONTINUE) — resume jusqu'au prochain bp |
+| **F10** | Step Over (DEBUG_STEP_OVER) — un hop, sans entrer dans les sub-trees Phase 5 |
+| **F11** | Step Into (DEBUG_STEP_INTO) — un hop, entre dans les sub-trees |
+| **Shift+F11** | Step Out (DEBUG_STEP_OUT, Phase 5+) — sort du sub-tree courant |
+| **Esc** | Cancel (DEBUG_CANCEL) — drop le msg, end session |
+| **F8** | Toggle breakpoint sur le node sélectionné (alternative au right-click) |
+
+`preventDefault()` sur ces key codes pour éviter que le browser
+les intercepte (F5 = refresh, F11 = fullscreen côté Chrome / Firefox)
+quand la session est active.
 
 Le DAG montre :
 - Le node actuellement paused → glow accent + animation "pulse"
@@ -234,9 +255,9 @@ breakpoint", ou icone dans l'inspector.
 | **4.5.2** | Pollen : pause + phone-home en mode `step`. C-side via @c block ouvre TCP au manager, envoie DEBUG_PAUSE, blocque sur recv. |
 | **4.5.3** | Manager : TCP server sur :3001 (séparé de :3000 HTTP). Reçoit DEBUG_PAUSE, push événement via WebSocket vers le browser. Browser → Manager → renvoie DEBUG_STEP au socket en attente. |
 | **4.5.4** | Mode `breakpoint` : Pollen filtre par role contre la bp list avant de pauser. |
-| **4.5.5** | UI : panel Debug, controls Step/Continue/Cancel, visualisation DAG des hops traversés. |
-| **4.5.6** | `DEBUG_MUTATE` : éditeur de payload dans l'UI, réinjection avec nouveau data. |
-| **4.5.7** | Right-click sur le DAG → toggle breakpoint sur un node. |
+| **4.5.5** | UI : panel Debug, controls Continue/Step Over/Step Into + DAG state (hops ✓ + paused glow). F5/F10/F11 keyboard shortcuts avec `preventDefault` global pendant la session. |
+| **4.5.6** | `DEBUG_MUTATE` : éditeur de payload dans l'UI, réinjection avec nouveau data ou avec `then: continue\|step_over`. |
+| **4.5.7** | Right-click sur le DAG → toggle breakpoint sur un node. F8 raccourci clavier équivalent sur node sélectionné. |
 | **4.5.8** | Session timeout + cleanup (60s sans réponse → cancel auto). |
 | **4.6** | Breakpoints conditionnels (dépend Phase 5 tree expressions). |
 | **4.7** | Sécurité : signature Manager + auth des connexions debug (Phase 7-like). |
@@ -277,6 +298,23 @@ breakpoint", ou icone dans l'inspector.
    `data`, le record `executions/<mid>-<role>.json` du hop
    suivant aura les nouvelles données. La chaîne parent reste
    valide (par messageId). À noter dans la doc.
+
+8. **Step Over vs Step Into sur DAG plat** : aujourd'hui (Phase 3.x
+   pas de tree), `next: [A, B, C]` est un fan-out à 3 nodes mais
+   il n'y a pas de notion de "sub-tree". F10 et F11 font donc
+   exactement la même chose : pause au premier next-node qui
+   répond. La distinction devient pertinente quand Phase 5
+   workflow-tree ship — un `{type:"call", action:"sub-workflow"}`
+   peut être stepped over (atomique) ou stepped into (entrer le
+   sub-tree). On expose les deux raccourcis dès Phase 4.5 pour
+   muscle memory IDE, ils convergent juste en attendant Phase 5.
+
+9. **Fan-out + step** : un node avec `next: [sink, audit, alerts]`
+   en mode `step` envoie 3 copies du msg ; chacune va re-pause à
+   son destinataire. La session debug a donc 3 hops paused
+   simultanément après un fan-out. Le panneau UI doit gérer une
+   liste de pauses actives + permettre de step/continue chacune
+   indépendamment, ou globalement via un bouton "Continue all".
 
 ## 10. Liens
 
