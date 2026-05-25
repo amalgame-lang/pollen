@@ -188,7 +188,11 @@ import Amalgame.String
             const char* envelope, size_t envelope_len,
             const char* manager_host_port,    /* NUL-terminated */
             const char* session_str,           /* NUL-terminated */
-            const char* role
+            const char* role,
+            char* resp_out,                    /* out: copy of the
+                                                 manager response line.
+                                                 May be NULL. */
+            size_t resp_out_cap
     ) {
         /* host:port split */
         char host[64];
@@ -256,6 +260,16 @@ import Amalgame.String
         close(fd);
         if (got <= 0) return POLLEN_DBG_TIMEOUT;
         rbuf[got] = 0;
+
+        /* Copy the raw response so the caller can extract MUTATE's
+         * data + then fields. Local rbuf goes out of scope on
+         * return otherwise. */
+        if (resp_out && resp_out_cap > 0) {
+            size_t copy = (size_t) got;
+            if (copy >= resp_out_cap) copy = resp_out_cap - 1;
+            memcpy(resp_out, rbuf, copy);
+            resp_out[copy] = 0;
+        }
 
         /* Type-field naive match. The manager only sends one of
          * a small fixed vocabulary. */
@@ -388,6 +402,109 @@ import Amalgame.String
         memcpy(out + o, new_hit_str, new_hit_len); o += new_hit_len;
         memcpy(out + o, hv_end, tail); o += tail;
         return o;
+    }
+
+    /* Phase 4.5.7 — rewrite `data` field in an envelope. Used by
+     * MUTATE : the operator edited the payload in the manager UI,
+     * we patch the envelope before forwarding so downstream nodes
+     * see the new data.
+     *
+     * Anchors :
+     *   start = end of `"data":`
+     *   end   = start of `,"timestamp":`
+     *           (our publisher always emits timestamp right after
+     *            data, so this is reliable)
+     *
+     * Returns total length on success, 0 on failure (caller falls
+     * back to forwarding the unmodified envelope). */
+    static size_t _pollen_debug_rewrite_data(
+            const char* in, size_t in_len,
+            char* out, size_t out_cap,
+            const char* new_data, size_t new_data_len
+    ) {
+        const char* d = _pollen_find(in, in_len, "\"data\":", 7);
+        if (!d) return 0;
+        const char* d_val_start = d + 7;
+        size_t after_off = (size_t)(d_val_start - in);
+        const char* d_end = _pollen_find(in + after_off,
+            in_len - after_off, ",\"timestamp\":", 13);
+        if (!d_end) return 0;
+
+        size_t pre  = (size_t)(d_val_start - in);
+        size_t tail = in_len - (size_t)(d_end - in);
+        size_t total = pre + new_data_len + tail;
+        if (total > out_cap) return 0;
+
+        memcpy(out, in, pre);
+        memcpy(out + pre, new_data, new_data_len);
+        memcpy(out + pre + new_data_len, d_end, tail);
+        return total;
+    }
+
+    /* Extract the JSON value of a `"<key>":<value>` pair where the
+     * value is a JSON OBJECT or ARRAY (matching braces / brackets).
+     * Used to pull out the `data` field of a DEBUG_MUTATE response
+     * which may itself be a complex value.
+     *
+     * `key_with_quotes` is e.g.  "\"data\":"
+     * Writes [start_off, end_off) into out params. Returns 1 on
+     * success, 0 if not found / unbalanced. */
+    static int _pollen_extract_json_value(
+            const char* buf, size_t buf_len,
+            const char* key_with_quotes, size_t key_len,
+            size_t* out_start, size_t* out_end
+    ) {
+        const char* k = _pollen_find(buf, buf_len, key_with_quotes, key_len);
+        if (!k) return 0;
+        const char* v = k + key_len;
+        /* Skip optional whitespace */
+        while (v < buf + buf_len && (*v == ' ' || *v == '\t')) v++;
+        if (v >= buf + buf_len) return 0;
+        size_t start = (size_t)(v - buf);
+        char open  = *v;
+        char close;
+        if      (open == '{') close = '}';
+        else if (open == '[') close = ']';
+        else if (open == '"') {
+            /* String value : walk until unescaped closing quote */
+            size_t i = start + 1;
+            while (i < buf_len) {
+                if (buf[i] == '\\') { i += 2; continue; }
+                if (buf[i] == '"') { *out_start = start; *out_end = i + 1; return 1; }
+                i++;
+            }
+            return 0;
+        } else {
+            /* Number / true / false / null : walk until , } ]
+             * or whitespace */
+            size_t i = start;
+            while (i < buf_len
+                   && buf[i] != ',' && buf[i] != '}' && buf[i] != ']'
+                   && buf[i] != ' ' && buf[i] != '\t'
+                   && buf[i] != '\n' && buf[i] != '\r') i++;
+            *out_start = start; *out_end = i; return 1;
+        }
+        /* Object / array : depth-counted scan */
+        int depth = 0;
+        for (size_t i = start; i < buf_len; i++) {
+            char c = buf[i];
+            if (c == '"') {
+                /* Skip string literal */
+                i++;
+                while (i < buf_len) {
+                    if (buf[i] == '\\') { i += 2; continue; }
+                    if (buf[i] == '"') break;
+                    i++;
+                }
+                continue;
+            }
+            if (c == open) depth++;
+            else if (c == close) {
+                depth--;
+                if (depth == 0) { *out_start = start; *out_end = i + 1; return 1; }
+            }
+        }
+        return 0;
     }
 
     /* Extract `"debug":{...,"manager":"<host:port>",...}` into a
@@ -1013,9 +1130,12 @@ import Amalgame.String
                             }
 
                             /* Phase 4.5.2 — debug pause / phone-home.
-                             * Phase 4.5.4 — mode rewrite on forward. */
+                             * Phase 4.5.4 — mode rewrite on forward.
+                             * Phase 4.5.7 — MUTATE handling. */
                             int dbg_dropped = 0;
                             int dbg_pause_cmd = -1;
+                            char dbg_resp[8192];
+                            dbg_resp[0] = 0;
                             if (dbg_session && dbg_session_len > 0) {
                                 int should = _pollen_debug_should_pause(
                                     rbuf, line_len, _pollen_self_role);
@@ -1034,7 +1154,8 @@ import Amalgame.String
                                         fflush(stdout);
                                         int cmd = _pollen_debug_pause(
                                             rbuf, line_len, mgr, sess,
-                                            _pollen_self_role);
+                                            _pollen_self_role,
+                                            dbg_resp, sizeof(dbg_resp));
                                         dbg_pause_cmd = cmd;
                                         const char* cmd_name = "?";
                                         switch (cmd) {
@@ -1072,6 +1193,60 @@ import Amalgame.String
                                  * producer thinks delivery is done. */
                             } else {
 
+                            /* Phase 4.5.7 — MUTATE handling. The
+                             * manager edited the msg.data and sent
+                             * a `{"type":"DEBUG_MUTATE","data":<json>,
+                             * "then":"continue|step_over|step_into"}`
+                             * response. Rewrite envelope.data, then
+                             * translate `then` into the equivalent
+                             * cmd code so the mode-rewrite pass
+                             * below picks it up. */
+                            char dbg_mutated[8192];
+                            const char* mutate_base = rbuf;
+                            size_t mutate_base_len = line_len;
+                            if (dbg_pause_cmd == POLLEN_DBG_MUTATE) {
+                                size_t data_start = 0, data_end = 0;
+                                size_t resp_len = strlen(dbg_resp);
+                                if (_pollen_extract_json_value(
+                                        dbg_resp, resp_len,
+                                        "\"data\":", 7,
+                                        &data_start, &data_end)) {
+                                    size_t rn = _pollen_debug_rewrite_data(
+                                        rbuf, line_len,
+                                        dbg_mutated, sizeof(dbg_mutated),
+                                        dbg_resp + data_start,
+                                        data_end - data_start);
+                                    if (rn > 0) {
+                                        mutate_base = dbg_mutated;
+                                        mutate_base_len = rn;
+                                    }
+                                }
+                                /* Map "then" → cmd code. Default
+                                 * to CONTINUE if missing. */
+                                const char* t = _pollen_find(dbg_resp,
+                                    resp_len, "\"then\":\"", 8);
+                                int new_cmd = POLLEN_DBG_CONTINUE;
+                                if (t) {
+                                    const char* tv = t + 8;
+                                    size_t remain = resp_len
+                                        - (size_t)(tv - dbg_resp);
+                                    if (remain >= 9
+                                        && memcmp(tv, "step_into", 9) == 0) {
+                                        new_cmd = POLLEN_DBG_STEP_INTO;
+                                    } else if (remain >= 9
+                                        && memcmp(tv, "step_over", 9) == 0) {
+                                        new_cmd = POLLEN_DBG_STEP_OVER;
+                                    }
+                                }
+                                dbg_pause_cmd = new_cmd;
+                                fprintf(stdout,
+                                    "debug: MUTATE → then=%s (cmd=%d)\n",
+                                    new_cmd == POLLEN_DBG_STEP_INTO ? "step_into"
+                                    : new_cmd == POLLEN_DBG_STEP_OVER ? "step_over"
+                                    : "continue", new_cmd);
+                                fflush(stdout);
+                            }
+
                             /* Phase 4.5.4 — rewrite debug.mode +
                              * debug.hit_bp on the forwarded
                              * envelope so downstream nodes see
@@ -1082,12 +1257,12 @@ import Amalgame.String
                              *   (no pause)     → forward as-is
                              */
                             char dbg_rewritten[8192];
-                            const char* fwd_buf = rbuf;
-                            size_t fwd_buf_len = line_len;
+                            const char* fwd_buf = mutate_base;
+                            size_t fwd_buf_len = mutate_base_len;
                             if (dbg_pause_cmd == POLLEN_DBG_STEP_OVER
                                 || dbg_pause_cmd == POLLEN_DBG_STEP_INTO) {
                                 size_t rn = _pollen_debug_rewrite(
-                                    rbuf, line_len,
+                                    mutate_base, mutate_base_len,
                                     dbg_rewritten, sizeof(dbg_rewritten),
                                     "step", 0);
                                 if (rn > 0) {
@@ -1096,7 +1271,7 @@ import Amalgame.String
                                 }
                             } else if (dbg_pause_cmd == POLLEN_DBG_CONTINUE) {
                                 size_t rn = _pollen_debug_rewrite(
-                                    rbuf, line_len,
+                                    mutate_base, mutate_base_len,
                                     dbg_rewritten, sizeof(dbg_rewritten),
                                     "breakpoint", 0);
                                 if (rn > 0) {
