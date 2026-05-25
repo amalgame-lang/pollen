@@ -327,6 +327,69 @@ import Amalgame.String
         return hit2 ? POLLEN_DBG_STEP_INTO : POLLEN_DBG_NO_PAUSE;
     }
 
+    /* Phase 4.5.4 — rewrite the debug.mode + debug.hit_bp values
+     * of an envelope before forwarding. The downstream chain then
+     * sees the operator's intent :
+     *   CONTINUE   → mode="breakpoint", hit_bp=false
+     *                → run until next bp (or end if no more bps)
+     *   STEP_*     → mode="step", hit_bp=false
+     *                → every downstream node pauses
+     * Returns the length of the rewritten envelope into `out`, or
+     * 0 if the envelope doesn't carry a debug field (caller falls
+     * back to forwarding verbatim — which is fine, no debug to
+     * rewrite). */
+    static size_t _pollen_debug_rewrite(
+            const char* in, size_t in_len,
+            char* out, size_t out_cap,
+            const char* new_mode,    /* "step" or "breakpoint" */
+            int new_hit_bp           /* 0 → false, 1 → true */
+    ) {
+        const char* m = _pollen_find(in, in_len, "\"mode\":\"", 8);
+        if (!m) return 0;
+        const char* mv_start = m + 8;
+        const char* mv_end = memchr(mv_start, '"',
+            in_len - (size_t)(mv_start - in));
+        if (!mv_end) return 0;
+
+        const char* h = _pollen_find(in, in_len, "\"hit_bp\":", 9);
+        if (!h) return 0;
+        const char* hv_start = h + 9;
+        const char* hv_end;
+        if (in_len - (size_t)(hv_start - in) >= 4
+            && memcmp(hv_start, "true", 4) == 0) {
+            hv_end = hv_start + 4;
+        } else if (in_len - (size_t)(hv_start - in) >= 5
+            && memcmp(hv_start, "false", 5) == 0) {
+            hv_end = hv_start + 5;
+        } else {
+            return 0;
+        }
+
+        /* Sanity : mode must come before hit_bp in the envelope
+         * (which is our canonical order). */
+        if (mv_end >= h) return 0;
+
+        const char* new_hit_str = new_hit_bp ? "true" : "false";
+        size_t new_mode_len = strlen(new_mode);
+        size_t new_hit_len  = strlen(new_hit_str);
+
+        size_t pre   = (size_t)(mv_start - in);
+        size_t mid   = (size_t)(h - mv_end);
+        size_t tail  = (size_t)((in + in_len) - hv_end);
+        size_t total = pre + new_mode_len + mid + 9 + new_hit_len + tail;
+
+        if (total > out_cap) return 0;
+
+        size_t o = 0;
+        memcpy(out + o, in, pre); o += pre;
+        memcpy(out + o, new_mode, new_mode_len); o += new_mode_len;
+        memcpy(out + o, mv_end, mid); o += mid;
+        memcpy(out + o, "\"hit_bp\":", 9); o += 9;
+        memcpy(out + o, new_hit_str, new_hit_len); o += new_hit_len;
+        memcpy(out + o, hv_end, tail); o += tail;
+        return o;
+    }
+
     /* Extract `"debug":{...,"manager":"<host:port>",...}` into a
      * NUL-terminated buffer. Returns 1 on success, 0 if not found. */
     static int _pollen_debug_extract_manager(
@@ -950,14 +1013,9 @@ import Amalgame.String
                             }
 
                             /* Phase 4.5.2 — debug pause / phone-home.
-                             * Only fires when the envelope carries a
-                             * debug session AND the local role matches
-                             * the session's pause criteria. CANCEL /
-                             * TIMEOUT / NO_CONN → drop the message,
-                             * skip forward + record. STEP_* / CONTINUE
-                             * → fall through to the normal forward
-                             * path (mode rewriting is Phase 4.5.4). */
+                             * Phase 4.5.4 — mode rewrite on forward. */
                             int dbg_dropped = 0;
+                            int dbg_pause_cmd = -1;
                             if (dbg_session && dbg_session_len > 0) {
                                 int should = _pollen_debug_should_pause(
                                     rbuf, line_len, _pollen_self_role);
@@ -977,6 +1035,7 @@ import Amalgame.String
                                         int cmd = _pollen_debug_pause(
                                             rbuf, line_len, mgr, sess,
                                             _pollen_self_role);
+                                        dbg_pause_cmd = cmd;
                                         const char* cmd_name = "?";
                                         switch (cmd) {
                                             case POLLEN_DBG_STEP_OVER: cmd_name = "STEP_OVER"; break;
@@ -1013,9 +1072,42 @@ import Amalgame.String
                                  * producer thinks delivery is done. */
                             } else {
 
+                            /* Phase 4.5.4 — rewrite debug.mode +
+                             * debug.hit_bp on the forwarded
+                             * envelope so downstream nodes see
+                             * the operator's intent :
+                             *   STEP_INTO/OVER → mode=step, hit_bp=false
+                             *   CONTINUE       → mode=breakpoint, hit_bp=false
+                             *                    (run to next bp or end)
+                             *   (no pause)     → forward as-is
+                             */
+                            char dbg_rewritten[8192];
+                            const char* fwd_buf = rbuf;
+                            size_t fwd_buf_len = line_len;
+                            if (dbg_pause_cmd == POLLEN_DBG_STEP_OVER
+                                || dbg_pause_cmd == POLLEN_DBG_STEP_INTO) {
+                                size_t rn = _pollen_debug_rewrite(
+                                    rbuf, line_len,
+                                    dbg_rewritten, sizeof(dbg_rewritten),
+                                    "step", 0);
+                                if (rn > 0) {
+                                    fwd_buf = dbg_rewritten;
+                                    fwd_buf_len = rn;
+                                }
+                            } else if (dbg_pause_cmd == POLLEN_DBG_CONTINUE) {
+                                size_t rn = _pollen_debug_rewrite(
+                                    rbuf, line_len,
+                                    dbg_rewritten, sizeof(dbg_rewritten),
+                                    "breakpoint", 0);
+                                if (rn > 0) {
+                                    fwd_buf = dbg_rewritten;
+                                    fwd_buf_len = rn;
+                                }
+                            }
+
                             char fwd_new_mid[37] = {0};
                             if (_pollen_wf_n_nexts > 0) {
-                                _pollen_wf_forward_all(rbuf, line_len,
+                                _pollen_wf_forward_all(fwd_buf, fwd_buf_len,
                                                        fwd_new_mid);
                                 if (parent_start) {
                                     fprintf(stdout,
