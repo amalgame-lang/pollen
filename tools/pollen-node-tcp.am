@@ -1459,6 +1459,66 @@ public class Program {
     // swap of consumes / nexts / emit topic. Returns true on
     // successful load (whether or not a role was found), false if
     // the file is missing / unparseable.
+    // ── Phase 5.0 — workflow.json schema v2 compat ──
+    //
+    // v1 (the shipped form) :
+    //   { "nodes": { "<role>": {host, port, consumes, emits, next}, … } }
+    //
+    // v2 (workflow-tree proposal) :
+    //   { "schema": "workflow-tree/v1",
+    //     "nodes":  [ {id, label?, host, port, consumes, emits, next}, … ],
+    //     "vars":   { … } }
+    //
+    // The internal representation stays the same in 5.0 — the v2
+    // `tree` field is ignored (Phase 5.1 will wire it). Adapter
+    // helpers normalize node lookup + iteration over both shapes.
+
+    // Detect v2 via the `schema` top-level field.
+    public static bool IsWorkflowV2(JsonValue root) {
+        let sV: JsonValue = root.Get("schema")
+        if (!sV.IsString()) { return false }
+        let s: string = sV.AsString()
+        return String_StartsWith(s, "workflow-tree/")
+    }
+
+    // Find a node by its key (role in v1 ; id or label in v2).
+    // Returns a JsonValue ; check IsObject() on the caller side
+    // to detect "not found".
+    public static JsonValue FindNodeByKey(JsonValue nodesV, string key) {
+        if (nodesV.IsObject()) {
+            return nodesV.Get(key)
+        }
+        if (nodesV.IsArray()) {
+            let items: List<JsonValue> = nodesV.AsArray()
+            let n: int = items.Count()
+            for i in 0..n {
+                let it: JsonValue = items.Get(i)
+                if (it.Get("id").AsString() == key)    { return it }
+                if (it.Get("label").AsString() == key) { return it }
+            }
+        }
+        return nodesV.Get("__pollen_missing_sentinel__")
+    }
+
+    // List the iteration keys for the nodes container. For v1 = the
+    // object keys ; for v2 = the label (preferred) or id of each entry.
+    public static List<string> NodeKeys(JsonValue nodesV) {
+        if (nodesV.IsObject()) { return nodesV.Keys() }
+        let out: List<string> = new List<string>()
+        if (nodesV.IsArray()) {
+            let items: List<JsonValue> = nodesV.AsArray()
+            let n: int = items.Count()
+            for i in 0..n {
+                let it: JsonValue = items.Get(i)
+                let lbl: string = it.Get("label").AsString()
+                if (String_Length(lbl) > 0) { out.Add(lbl); continue }
+                let id: string = it.Get("id").AsString()
+                if (String_Length(id) > 0) { out.Add(id) }
+            }
+        }
+        return out
+    }
+
     public static bool LoadWorkflow(string workflowPath, string nodeName, int actualPort) {
         if (!File_Exists(workflowPath)) {
             Console.WriteLine("workflow: file not found: {workflowPath}")
@@ -1476,19 +1536,22 @@ public class Program {
         let wfVerV:  JsonValue = root.Get("version")
         let wfName:  string = wfNameV.AsString()
         let wfVer:   int    = wfVerV.AsInt()
-        let nodesV:  JsonValue = root.Get("nodes")
-        if (!nodesV.IsObject()) {
-            Console.WriteLine("workflow: 'nodes' missing or not an object")
+        let nodesV: JsonValue = root.Get("nodes")
+        let isV2: bool = Program.IsWorkflowV2(root)
+        // v1 → object ; v2 → array. Either is fine.
+        let nodesOk: bool = nodesV.IsObject() || nodesV.IsArray()
+        if (!nodesOk) {
+            Console.WriteLine("workflow: 'nodes' missing or not an object/array")
             return false
         }
         // Find role (--node-name override beats port lookup).
         var role: string = nodeName
         if (String_Length(role) == 0) {
-            let nodeKeys: List<string> = nodesV.Keys()
+            let nodeKeys: List<string> = Program.NodeKeys(nodesV)
             let nk: int = nodeKeys.Count()
             for ki in 0..nk {
                 let key: string = nodeKeys.Get(ki)
-                let entry: JsonValue = nodesV.Get(key)
+                let entry: JsonValue = Program.FindNodeByKey(nodesV, key)
                 let pV: JsonValue = entry.Get("port")
                 let p: int = pV.AsInt()
                 if (p == actualPort) {
@@ -1503,7 +1566,7 @@ public class Program {
             Console.WriteLine("workflow: no role matches port :{actualPort}; running in free-form mode")
             return true
         }
-        let me: JsonValue = nodesV.Get(role)
+        let me: JsonValue = Program.FindNodeByKey(nodesV, role)
         if (!me.IsObject()) {
             @c { _pollen_wf_reload_commit(); }
             Console.WriteLine("workflow: role '{role}' not in nodes")
@@ -1538,7 +1601,7 @@ public class Program {
             for xi in 0..xn {
                 let xit: JsonValue = nxtItems.Get(xi)
                 let nextRole: string = xit.AsString()
-                let nextNode: JsonValue = nodesV.Get(nextRole)
+                let nextNode: JsonValue = Program.FindNodeByKey(nodesV, nextRole)
                 if (nextNode.IsObject()) {
                     let nhV: JsonValue = nextNode.Get("host")
                     let npV: JsonValue = nextNode.Get("port")
@@ -1549,7 +1612,9 @@ public class Program {
             }
         }
         @c { _pollen_wf_reload_commit(); }
-        Console.WriteLine("workflow: loaded '{wfName}' v{wfVer} role={role} consumes=[{conS}] emits=[{emiS}] next=[{nxtS}]")
+        var schemaTag: string = "v1"
+        if (isV2) { schemaTag = "v2" }
+        Console.WriteLine("workflow: loaded '{wfName}' v{wfVer} ({schemaTag}) role={role} consumes=[{conS}] emits=[{emiS}] next=[{nxtS}]")
         Console.Flush()
         return true
     }
