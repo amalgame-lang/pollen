@@ -122,12 +122,14 @@ RND_LIB="$RND_CACHE_BASE/$RND_VER/build/linux-x86_64/libamalgame-pkg-Random.a"
 [ -f "$RND_FACADE" ] || die "random facade.am missing at $RND_FACADE"
 [ -f "$RND_LIB" ]    || die "random build archive missing at $RND_LIB — try \`amc package add random\` again"
 
-# Compile pollen-node.am with json.am + datetime facade as extra
-# sources so JsonParser / DateTime class methods resolve.
+# Compile pollen-node.am with json.am + datetime + random facades
+# as extra sources. Phase 1.5b added node-side publish that pulls
+# UUIDv4 from amalgame-random.
 (cd "$BUILD_DIR" && "$AMC" -o pollen-node \
     "$SRC_DIR/tools/pollen-node.am" \
     "$AMC_STDLIB/json.am" \
     "$DT_FACADE" \
+    "$RND_FACADE" \
     --quiet)
 [ -f "$BUILD_DIR/pollen-node.c" ] || die "amc didn't produce pollen-node.c"
 
@@ -147,7 +149,7 @@ done
 # the precompiled libamalgame-pkg-DateTime.a archive that ships in
 # the package cache.
 gcc -O2 -I"$AMC_RUNTIME" $PKG_INCS "$BUILD_DIR/pollen-node.c" \
-    "$DT_LIB" -lgc -lm -lz -ldl -lpthread \
+    "$DT_LIB" "$RND_LIB" -lgc -lm -lz -ldl -lpthread \
     -o "$BUILD_DIR/pollen-node-bin" \
     || die "gcc link failed (pollen-node)"
 

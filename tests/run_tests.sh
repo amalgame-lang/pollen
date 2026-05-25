@@ -93,10 +93,10 @@ echo "── building pollen-node + pollen-client ──"
 
 (cd "$BUILD_DIR" && "$AMC" -o pollen-node \
     "$PKG_ROOT/tools/pollen-node.am" \
-    "$AMC_STDLIB/json.am" "$DT_FACADE" --quiet) \
+    "$AMC_STDLIB/json.am" "$DT_FACADE" "$RND_FACADE" --quiet) \
     || { echo "ERROR: amc compile pollen-node failed" >&2; exit 1; }
 gcc -O2 -I"$AMC_RUNTIME" $PKG_INCS \
-    "$BUILD_DIR/pollen-node.c" "$DT_LIB" \
+    "$BUILD_DIR/pollen-node.c" "$DT_LIB" "$RND_LIB" \
     -lgc -lm -lz -ldl -lpthread \
     -o "$BUILD_DIR/pollen-node-bin" \
     || { echo "ERROR: gcc link pollen-node failed" >&2; exit 1; }
@@ -216,6 +216,58 @@ if [ $RC -eq 4 ] && [ $ELAPSED_MS -ge 4800 ] && [ $ELAPSED_MS -le 6000 ]; then
     pass "retry timeout: rc=4 after ~5 s ($ELAPSED_MS ms, 5 × 1 s)"
 else
     fail "retry timeout (rc=$RC, elapsed=${ELAPSED_MS}ms)"
+fi
+
+# ── 7. node↔node publish (Phase 1.5b) ────────────────
+# Spawn a second 'receiver' node on a freshly-allocated port, then
+# spawn a 'publisher' node that --publish'es to it at startup. The
+# receiver logs the MESSAGE, the publisher logs the matching ACK
+# with '(publish complete)'.
+RECV_LOG="$BUILD_DIR/recv.log"
+"$NODE_BIN" 0 > "$RECV_LOG" 2>&1 &
+RECV_PID=$!
+sleep 0.3
+RECV_PORT=$(grep -oE "UDP :[0-9]+" "$RECV_LOG" | head -1 | grep -oE "[0-9]+" || true)
+if [ -z "$RECV_PORT" ]; then
+    fail "node↔node: receiver never logged its port"
+else
+    PUB_LOG="$BUILD_DIR/pub.log"
+    "$NODE_BIN" 0 --publish "127.0.0.1:$RECV_PORT:t-from-pub:1:{\"k\":1}" > "$PUB_LOG" 2>&1 &
+    PUB_PID=$!
+    sleep 0.8
+    if grep -q "(publish complete)" "$PUB_LOG"; then
+        pass "node↔node: publisher saw 'publish complete' ACK from receiver"
+    else
+        fail "node↔node: no 'publish complete' line in publisher log"
+    fi
+    if grep -q "recv MESSAGE .* topic=t-from-p" "$RECV_LOG"; then
+        pass "node↔node: receiver logged MESSAGE from publisher"
+    else
+        fail "node↔node: receiver missed the MESSAGE"
+    fi
+    kill $PUB_PID 2>/dev/null; wait $PUB_PID 2>/dev/null
+    kill $RECV_PID 2>/dev/null; wait $RECV_PID 2>/dev/null
+fi
+
+# ── 8. node-side publish TIMEOUT path ────────────────
+# Publish to an unreachable port (1) — pendingMessages retries 5×
+# then emits 'publish TIMEOUT'. Check the line + elapsed window.
+TPUB_LOG="$BUILD_DIR/tpub.log"
+T0=$(date +%s%N)
+"$NODE_BIN" 0 --publish "127.0.0.1:1:nowhere:1:{}" > "$TPUB_LOG" 2>&1 &
+TPUB_PID=$!
+# Poll for the TIMEOUT line — should appear after ~5 s.
+for _ in $(seq 1 40); do
+    sleep 0.2
+    grep -q "publish TIMEOUT" "$TPUB_LOG" 2>/dev/null && break
+done
+T1=$(date +%s%N)
+TIMEOUT_MS=$(( (T1 - T0) / 1000000 ))
+kill $TPUB_PID 2>/dev/null; wait $TPUB_PID 2>/dev/null
+if grep -q "publish TIMEOUT" "$TPUB_LOG" && [ $TIMEOUT_MS -ge 4500 ] && [ $TIMEOUT_MS -le 6500 ]; then
+    pass "node publish TIMEOUT after ~5 s ($TIMEOUT_MS ms, 5 attempts)"
+else
+    fail "node publish TIMEOUT (elapsed=${TIMEOUT_MS}ms, log=$(tail -1 "$TPUB_LOG"))"
 fi
 
 echo ""

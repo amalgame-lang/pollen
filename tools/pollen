@@ -70,12 +70,17 @@ cmd_run() {
                 amc_stdlib="$amc_dir/src/stdlib"
             fi
             local dt_base="$HOME/.amalgame/packages/github.com/amalgame-lang/amalgame-datetime"
-            [ -d "$dt_base" ] || { echo "pollen: amalgame-datetime missing — run 'amc package add datetime'" >&2; exit 2; }
-            local dt_ver dt_facade dt_lib
+            local rnd_base="$HOME/.amalgame/packages/github.com/amalgame-lang/amalgame-random"
+            [ -d "$dt_base" ]  || { echo "pollen: amalgame-datetime missing — run 'amc package add datetime'" >&2; exit 2; }
+            [ -d "$rnd_base" ] || { echo "pollen: amalgame-random missing — run 'amc package add random'" >&2; exit 2; }
+            local dt_ver dt_facade dt_lib rnd_ver rnd_facade rnd_lib
             dt_ver=$(ls -1 "$dt_base" 2>/dev/null | sort -V | tail -1)
+            rnd_ver=$(ls -1 "$rnd_base" 2>/dev/null | sort -V | tail -1)
             dt_facade="$dt_base/$dt_ver/facade.am"
             dt_lib="$dt_base/$dt_ver/build/linux-x86_64/libamalgame-pkg-DateTime.a"
-            (cd "$tmpdir" && amc -o pollen-node "$SCRIPT_DIR/pollen-node.am" "$amc_stdlib/json.am" "$dt_facade" --quiet) \
+            rnd_facade="$rnd_base/$rnd_ver/facade.am"
+            rnd_lib="$rnd_base/$rnd_ver/build/linux-x86_64/libamalgame-pkg-Random.a"
+            (cd "$tmpdir" && amc -o pollen-node "$SCRIPT_DIR/pollen-node.am" "$amc_stdlib/json.am" "$dt_facade" "$rnd_facade" --quiet) \
                 || { echo "pollen: amc compile failed" >&2; exit 2; }
             local pkg_incs=""
             for d in "$HOME"/.amalgame/packages/github.com/amalgame-lang/*/; do
@@ -84,7 +89,7 @@ cmd_run() {
                 latest=$(ls -1 "$d" 2>/dev/null | sort -V | tail -1)
                 [ -n "$latest" ] && pkg_incs="$pkg_incs -I$d$latest/runtime"
             done
-            gcc -O2 -I"$amc_runtime" $pkg_incs "$tmpdir/pollen-node.c" "$dt_lib" \
+            gcc -O2 -I"$amc_runtime" $pkg_incs "$tmpdir/pollen-node.c" "$dt_lib" "$rnd_lib" \
                 -lgc -lm -lz -ldl -lpthread -o "$tmpdir/pollen-node-bin" \
                 || { echo "pollen: gcc link failed" >&2; exit 2; }
             bin="$tmpdir/pollen-node-bin"

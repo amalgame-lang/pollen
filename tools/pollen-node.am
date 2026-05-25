@@ -1,4 +1,4 @@
-// Pollen — UDP node daemon (Phase 1.5: + sharedDir persistence)
+// Pollen — UDP node daemon (Phase 1.5b: + publish API w/ retry)
 //
 // Wire-compatible with TARMeule v1: parses + emits JSON envelopes:
 //
@@ -35,6 +35,7 @@ namespace Pollen.Node
 import Amalgame.Net
 import Amalgame.Formats.Json
 import Amalgame.DateTime
+import Amalgame.Random
 import Amalgame.Collections
 import Amalgame.String
 
@@ -54,13 +55,68 @@ public class DedupEntry {
     }
 }
 
+// ── Outbound pending-ACK entry (Phase 1.5b) ───────────
+//
+// One per MESSAGE we've sent and are still waiting for an ACK on.
+// Re-sent every ackTimeoutMs until either a matching ACK arrives
+// (removed via PendingRemove) or maxAttempts is reached (emits a
+// 'publish timeout' log + removed).
+
+public class PendingMessage {
+    public MessageId: string
+    public PeerIp:    string
+    public PeerPort:  int
+    public Body:      string    // pre-encoded JSON envelope, reused on retry
+    public SentAtMs:  int       // when the LAST attempt fired
+    public Attempts:  int       // 1 = initial send; retries grow this
+
+    public PendingMessage(string id, string ip, int port, string body, int sentAt) {
+        this.MessageId = id
+        this.PeerIp    = ip
+        this.PeerPort  = port
+        this.Body      = body
+        this.SentAtMs  = sentAt
+        this.Attempts  = 1
+    }
+}
+
 public class Program {
 
-    // TARMeule defaults — kept identical so a mixed cluster works.
+    // Retry constants. Conservative defaults for LAN; expose via
+    // CLI in a later phase. Window = ackTimeout × maxAttempts × 1.5
+    // gives the dedup cache enough room to swallow a retry burst.
     public static int AckTimeoutMs() { return 1000 }
-    public static int MaxRetries()   { return 5 }
-    // Window = ackTimeout × maxRetries × 1.5 = 7500 ms.
+    public static int MaxAttempts()  { return 5 }   // initial send + 4 retries
     public static int DedupWindowMs() { return 7500 }
+
+    // ── UUIDv4 (RFC 4122) ─────────────────────────────
+    //
+    // Same construction as pollen-client: 16 bytes of OS entropy
+    // via amalgame-random, version (4) in byte 6, variant (10xx)
+    // in byte 8. TARMeule-compatible.
+
+    public static string ByteHex(b: int) {
+        let digits: string = "0123456789abcdef"
+        let hi: int = (b >> 4) & 15
+        let lo: int = b & 15
+        return String_CharAt1(digits, hi) + String_CharAt1(digits, lo)
+    }
+
+    public static string UuidV4() {
+        let bytes: List<int> = Random.SystemBytes(16)
+        let b6: int = (bytes.Get(6) & 15) | 64
+        let b8: int = (bytes.Get(8) & 63) | 128
+        bytes.Set(6, b6)
+        bytes.Set(8, b8)
+        var out: string = ""
+        var i: int = 0
+        while (i < 16) {
+            if (i == 4 || i == 6 || i == 8 || i == 10) { out = out + "-" }
+            out = out + Program.ByteHex(bytes.Get(i))
+            i = i + 1
+        }
+        return out
+    }
 
     // ── current epoch ms ──────────────────────────────
     //
@@ -115,6 +171,52 @@ public class Program {
         v.AppendEntry("messageId", Json.OfString(messageId))
         v.AppendEntry("timestamp", Json.OfInt(timestamp))
         return Json.Encode(v)
+    }
+
+    // ── MESSAGE envelope ──────────────────────────────
+    //
+    // Hand-built string so the caller's `dataJson` bytes flow
+    // through verbatim (a JsonValue round-trip would canonicalise
+    // and reorder keys). Same pattern as pollen-client.
+
+    public static string EncodeMessage(string topicUuid, int topicVersion,
+                                       string dataJson, string messageId,
+                                       int timestamp) {
+        let mid: string = Json.EscapeString(messageId)
+        let tu:  string = Json.EscapeString(topicUuid)
+        let tv:  string = String_FromInt(topicVersion)
+        let ts:  string = String_FromInt(timestamp)
+        return "{\"messageId\":\"" + mid +
+               "\",\"type\":\"MESSAGE\"," +
+               "\"topic\":{\"uuid\":\"" + tu +
+               "\",\"version\":" + tv + "}," +
+               "\"data\":" + dataJson + "," +
+               "\"timestamp\":" + ts + "}"
+    }
+
+    // ── Outbound pending-ACK machinery ────────────────
+    //
+    // Publish() / ProcessPending() would naturally live here as
+    // static helpers, but amc's cgen currently mis-namespaces the
+    // built-in C struct `AmalgameUdpSocket` when it appears in an
+    // AM function signature (treats it as a Pollen.Node-local
+    // class). The logic is inlined in Main instead — short enough
+    // that the DRY loss is fine, and will refactor once amc fixes
+    // the resolver quirk.
+
+    // Remove the matching messageId from pending on incoming ACK.
+    // Returns true if a match was found (caller can log). This one
+    // doesn't need the socket so it stays a Program method.
+    public static bool PendingRemove(List<PendingMessage> pending, string messageId) {
+        let n: int = pending.Count()
+        for i in 0..n {
+            let p: PendingMessage = pending.Get(i)
+            if (p.MessageId == messageId) {
+                pending.RemoveAt(i)
+                return true
+            }
+        }
+        return false
     }
 
     // ── topic summary for logs ────────────────────────
@@ -204,10 +306,15 @@ public class Program {
     }
 
     public static void Main(string[] args) {
-        var port:      int    = 5000
-        var sharedDir: string = ""
+        var port:        int    = 5000
+        var sharedDir:   string = ""
+        var publishSpec: string = ""
 
-        // Tiny arg parser: [port] [--shared <dir>] in any order.
+        // Arg parser:
+        //   [port] [--shared <dir>] [--publish ip:port:uuid:ver:data] *
+        // Multiple --publish flags can be passed; semicolons inside
+        // one --publish split into successive publishes (lets
+        // load-test scripts hand a single arg with N specs).
         var i: int = 1
         while (i < Args_Count()) {
             let a: string = Args_Get(i)
@@ -218,6 +325,19 @@ public class Program {
                     continue
                 }
                 Console.WriteLine("pollen-node: --shared needs a directory argument")
+                return
+            }
+            if (a == "--publish") {
+                if (i + 1 < Args_Count()) {
+                    if (String_Length(publishSpec) > 0) {
+                        publishSpec = publishSpec + ";" + Args_Get(i + 1)
+                    } else {
+                        publishSpec = Args_Get(i + 1)
+                    }
+                    i = i + 2
+                    continue
+                }
+                Console.WriteLine("pollen-node: --publish needs ip:port:uuid:ver:data")
                 return
             }
             // First positional = port.
@@ -235,7 +355,7 @@ public class Program {
         }
         let actualPort: int = sock.BoundPort
         Console.WriteLine("pollen-node: listening on UDP :{actualPort}")
-        Console.WriteLine("pollen-node: wire = TARMeule v1 (JSON), dedup window = 7500 ms")
+        Console.WriteLine("pollen-node: JSON wire, dedup window = 7500 ms")
 
         // Phase 1.5: optional sharedDir scan at startup.
         if (String_Length(sharedDir) > 0) {
@@ -251,14 +371,85 @@ public class Program {
         // buffer to fill or for the process to exit.
         Console.Flush()
 
-        let dedup: List<DedupEntry> = new List<DedupEntry>()
+        let dedup:   List<DedupEntry>     = new List<DedupEntry>()
+        let pending: List<PendingMessage> = new List<PendingMessage>()
 
-        // Receive loop. 200 ms timeout lets Phase 1.4 retry sweep
-        // interleave without burning CPU.
+        // Phase 1.5b — startup-time publishes. Spec format
+        // (semicolon-separated list of):
+        //   ip:port:topic-uuid:version:data-json
+        // The data-json must be a single JSON value; embed colons
+        // freely inside string fields, but be aware that a literal
+        // ':' outside a quoted region will split. (Move to a richer
+        // format if a user runs into this — for now KISS works.)
+        if (String_Length(publishSpec) > 0) {
+            let specs: List<string> = String_Split(publishSpec, ";")
+            let m: int = specs.Count()
+            for si in 0..m {
+                let spec: string = specs.Get(si)
+                if (String_Length(spec) == 0) { continue }
+                let parts: List<string> = String_Split(spec, ":")
+                if (parts.Count() < 5) {
+                    Console.WriteLine("pollen-node: --publish spec needs ip:port:uuid:ver:data ({spec})")
+                    continue
+                }
+                let pIp:   string = parts.Get(0)
+                let pPort: int    = String_ToInt(parts.Get(1))
+                let pUuid: string = parts.Get(2)
+                let pVer:  int    = String_ToInt(parts.Get(3))
+                // Re-join in case the data-json contained ':' chars
+                // (we split on every ':'). Skip the first 4 segments.
+                var pData: string = parts.Get(4)
+                var pj: int = 5
+                while (pj < parts.Count()) {
+                    pData = pData + ":" + parts.Get(pj)
+                    pj = pj + 1
+                }
+                // Inline of Program.Publish (see comment above the
+                // PendingRemove helper for why we don't carry the
+                // AmalgameUdpSocket through a function signature).
+                let mid:  string = Program.UuidV4()
+                let nowP: int    = Program.NowMs()
+                let body: string = Program.EncodeMessage(pUuid, pVer, pData, mid, nowP)
+                UdpSocket_Send(sock, pIp, pPort, body)
+                pending.Add(new PendingMessage(mid, pIp, pPort, body, nowP))
+                Console.WriteLine("publish {mid} to {pIp}:{pPort} topic={pUuid} v{pVer}")
+            }
+            Console.Flush()
+        }
+
+        // Receive loop. 200 ms timeout lets the pending-ACK retry
+        // sweep interleave without burning CPU.
         while (true) {
             let dg = UdpSocket_ReceiveFrom(sock, 65536, 200)
             let now: int = Program.NowMs()
             Program.DedupGC(dedup, now)
+
+            // Inline pending-ACK retry sweep — see note above the
+            // PendingRemove helper for why this isn't a separate
+            // static method.
+            var pi: int = 0
+            var pendingTouched: bool = false
+            while (pi < pending.Count()) {
+                let pm: PendingMessage = pending.Get(pi)
+                let due: int = pm.SentAtMs + Program.AckTimeoutMs()
+                if (now < due) { pi = pi + 1; continue }
+                if (pm.Attempts >= Program.MaxAttempts()) {
+                    Console.WriteLine("publish TIMEOUT {pm.MessageId} to {pm.PeerIp}:{pm.PeerPort} after {pm.Attempts} attempts")
+                    pending.RemoveAt(pi)
+                    pendingTouched = true
+                    continue
+                }
+                UdpSocket_Send(sock, pm.PeerIp, pm.PeerPort, pm.Body)
+                pm.Attempts = pm.Attempts + 1
+                pm.SentAtMs = now
+                Console.WriteLine("publish retry {pm.MessageId} to {pm.PeerIp}:{pm.PeerPort} (attempt {pm.Attempts})")
+                pendingTouched = true
+                pi = pi + 1
+            }
+            // Block-buffered stdout: flush whenever we emitted a
+            // log line in the sweep, otherwise supervisors never
+            // see retries until the process exits.
+            if (pendingTouched) { Console.Flush() }
 
             if (dg == null) { continue }
 
@@ -293,8 +484,12 @@ public class Program {
             if (mtype == "ACK") {
                 let midV: JsonValue = env.Get("messageId")
                 let mid: string = midV.AsString()
-                Console.WriteLine("recv ACK from {fromIp}:{fromPort} for {mid}")
-                // Phase 1.4 will: remove mid from pendingMessages
+                let matched: bool = Program.PendingRemove(pending, mid)
+                if (matched) {
+                    Console.WriteLine("recv ACK from {fromIp}:{fromPort} for {mid} (publish complete)")
+                } else {
+                    Console.WriteLine("recv ACK from {fromIp}:{fromPort} for {mid} (no pending match)")
+                }
                 Console.Flush()
                 continue
             }
