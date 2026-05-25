@@ -62,10 +62,158 @@ import Amalgame.String
     #include <stdint.h>
     #include <time.h>
 
+    /* Forward decl: needed by _pollen_wf_rewrite_topic below which
+     * comes before the actual definition further down. */
+    static const char* _pollen_find(const char* hay, size_t hlen,
+                                     const char* needle, size_t nlen);
+
     static int64_t _pollen_now_ms_c(void) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         return (int64_t) ts.tv_sec * 1000 + (int64_t) ts.tv_nsec / 1000000;
+    }
+
+    /* ── workflow.json runtime state (Phase 3.1/3.2) ────
+     *
+     * Populated once at startup from AM (which has the JSON
+     * parser). After that the hot path reads it lock-free —
+     * the workflow file is constant for a node's lifetime
+     * (Phase 3.3 will add filewatcher reload behind a swap).
+     *
+     * Topic strings are NUL-terminated. Next-node addresses are
+     * (host, port) pairs ready for sockaddr_in.
+     *
+     * Sizing: 32 consumes + 32 nexts handles every realistic
+     * workflow we care about today (real-world DAGs are typically
+     * narrow); bigger configurations can lift these statically.
+     */
+    #define POLLEN_MAX_CONSUMES 32
+    #define POLLEN_MAX_NEXTS    32
+    #define POLLEN_TOPIC_MAX    128
+    #define POLLEN_HOST_MAX     64
+
+    static int  _pollen_wf_active = 0;
+    static int  _pollen_wf_n_consumes = 0;
+    static int  _pollen_wf_n_nexts = 0;
+    static char _pollen_wf_consumes[POLLEN_MAX_CONSUMES][POLLEN_TOPIC_MAX];
+    static char _pollen_wf_next_host[POLLEN_MAX_NEXTS][POLLEN_HOST_MAX];
+    static int  _pollen_wf_next_port[POLLEN_MAX_NEXTS];
+    /* Phase 3.2: when this node emits, forward MESSAGEs to the
+     * next-list with topic.uuid replaced by _pollen_wf_emit_topic
+     * (first entry of the node's `emits` list in workflow.json).
+     * Empty = forward verbatim (rare case where a router-only
+     * node doesn't transform). */
+    static char _pollen_wf_emit_topic[POLLEN_TOPIC_MAX] = "";
+
+    static void _pollen_wf_add_consume(const char* topic) {
+        if (_pollen_wf_n_consumes >= POLLEN_MAX_CONSUMES) return;
+        strncpy(_pollen_wf_consumes[_pollen_wf_n_consumes], topic,
+                POLLEN_TOPIC_MAX - 1);
+        _pollen_wf_consumes[_pollen_wf_n_consumes][POLLEN_TOPIC_MAX - 1] = '\0';
+        _pollen_wf_n_consumes++;
+        _pollen_wf_active = 1;
+    }
+
+    static void _pollen_wf_add_next(const char* host, int port) {
+        if (_pollen_wf_n_nexts >= POLLEN_MAX_NEXTS) return;
+        strncpy(_pollen_wf_next_host[_pollen_wf_n_nexts], host,
+                POLLEN_HOST_MAX - 1);
+        _pollen_wf_next_host[_pollen_wf_n_nexts][POLLEN_HOST_MAX - 1] = '\0';
+        _pollen_wf_next_port[_pollen_wf_n_nexts] = port;
+        _pollen_wf_n_nexts++;
+        _pollen_wf_active = 1;
+    }
+
+    static void _pollen_wf_set_emit_topic(const char* topic) {
+        strncpy(_pollen_wf_emit_topic, topic, POLLEN_TOPIC_MAX - 1);
+        _pollen_wf_emit_topic[POLLEN_TOPIC_MAX - 1] = '\0';
+    }
+
+    /* O(N×M) consume check; with N ≤ 32 and 128-byte topics this
+     * stays sub-µs and keeps the hot loop branchless of mallocs. */
+    static int _pollen_wf_topic_consumed(const char* topic, size_t topic_len) {
+        for (int i = 0; i < _pollen_wf_n_consumes; i++) {
+            size_t l = strlen(_pollen_wf_consumes[i]);
+            if (l == topic_len && memcmp(_pollen_wf_consumes[i], topic, l) == 0) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    /* One-shot forward to a single next-node. Opens a fresh TCP
+     * connection, sends the envelope verbatim + '\n', closes.
+     * The next-node ACKs back through its own server thread; we
+     * don't wait for that ACK (fire-and-pipeline). Persistent
+     * forward connections are a Phase 3.x optimisation.
+     */
+    static void _pollen_wf_forward_one(const char* host, int port,
+                                        const char* envelope, size_t env_len) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return;
+        struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons((uint16_t) port);
+        if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) { close(fd); return; }
+        if (connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) { close(fd); return; }
+        /* Append '\n' if envelope doesn't already end with one. */
+        if (env_len > 0 && envelope[env_len - 1] == '\n') {
+            send(fd, envelope, env_len, MSG_NOSIGNAL);
+        } else {
+            send(fd, envelope, env_len, MSG_NOSIGNAL);
+            send(fd, "\n", 1, MSG_NOSIGNAL);
+        }
+        /* Half-close to let next-node know there's no more data
+         * coming. We don't bother reading its ACK back — for
+         * Phase 3.2 the forward is fire-and-pipeline. */
+        shutdown(fd, SHUT_WR);
+        char throwaway[256];
+        while (recv(fd, throwaway, sizeof(throwaway), 0) > 0) {}
+        close(fd);
+    }
+
+    /* Rewrite topic.uuid in-place in a fresh buffer. Returns the
+     * length of the rewritten envelope, or 0 if the topic block
+     * couldn't be located (caller falls back to verbatim forward).
+     * The envelope shape is the publisher's snprintf output:
+     *   {…,"topic":{"uuid":"<old>","version":N},…}
+     * We replace `<old>` with the global _pollen_wf_emit_topic.
+     */
+    static size_t _pollen_wf_rewrite_topic(const char* in, size_t in_len,
+                                            char* out, size_t out_cap) {
+        const char* TOPIC_KEY = "\"topic\":{\"uuid\":\"";
+        const size_t TOPIC_KEY_LEN = 17;
+        const char* tp = _pollen_find(in, in_len, TOPIC_KEY, TOPIC_KEY_LEN);
+        if (!tp) return 0;
+        tp += TOPIC_KEY_LEN;
+        const char* tq = memchr(tp, '"', in_len - (size_t)(tp - in));
+        if (!tq) return 0;
+        size_t prefix_len = (size_t)(tp - in);
+        size_t suffix_off = (size_t)(tq - in);
+        size_t suffix_len = in_len - suffix_off;
+        size_t new_topic_len = strlen(_pollen_wf_emit_topic);
+        size_t total = prefix_len + new_topic_len + suffix_len;
+        if (total > out_cap) return 0;
+        memcpy(out, in, prefix_len);
+        memcpy(out + prefix_len, _pollen_wf_emit_topic, new_topic_len);
+        memcpy(out + prefix_len + new_topic_len, in + suffix_off, suffix_len);
+        return total;
+    }
+
+    static void _pollen_wf_forward_all(const char* envelope, size_t env_len) {
+        char rewritten[4096];
+        const char* fwd = envelope;
+        size_t fwd_len = env_len;
+        if (_pollen_wf_emit_topic[0] != '\0') {
+            size_t rn = _pollen_wf_rewrite_topic(envelope, env_len,
+                                                  rewritten, sizeof(rewritten));
+            if (rn > 0) { fwd = rewritten; fwd_len = rn; }
+        }
+        for (int i = 0; i < _pollen_wf_n_nexts; i++) {
+            _pollen_wf_forward_one(_pollen_wf_next_host[i],
+                                   _pollen_wf_next_port[i],
+                                   fwd, fwd_len);
+        }
     }
 
     /* Portable substring search — memmem is glibc-only and _GNU_SOURCE
@@ -233,7 +381,48 @@ import Amalgame.String
                  * but the publisher in this file always emits it
                  * first so memmem returns quickly. */
                 const char* mp = _pollen_find(rbuf, line_len, MID_KEY, MID_KEY_LEN);
-                if (mp) {
+                /* Phase 3.1/3.2 — if a workflow is active, extract
+                 * topic.uuid from the envelope and decide what to do.
+                 * Otherwise (free-form mode) every MESSAGE is ACKed,
+                 * matching pre-3.0 behaviour.
+                 *
+                 *  workflow MODE matrix:
+                 *    topic ∈ consumes : ACK + forward to every next
+                 *    topic ∉ consumes : drop silently (no ACK)
+                 *    (no consumes at all : ACK anyway — pure sink-or-
+                 *     pure-producer nodes still need to accept whatever
+                 *     reaches them)
+                 */
+                int do_ack = 1;
+                int do_forward = 0;
+                const char* topic_start = NULL;
+                size_t topic_len = 0;
+                if (_pollen_wf_active && _pollen_wf_n_consumes > 0) {
+                    /* find topic.uuid — search for "topic":{"uuid":" in
+                     * order, then read up to next '"'. The publisher in
+                     * this file emits in that order; if reorder ever
+                     * happens we'd miss the consume check but still
+                     * ACK as a fallback. */
+                    const char* TOPIC_KEY = "\"topic\":{\"uuid\":\"";
+                    const size_t TOPIC_KEY_LEN = 17;
+                    const char* tp = _pollen_find(rbuf, line_len,
+                        TOPIC_KEY, TOPIC_KEY_LEN);
+                    if (tp) {
+                        tp += TOPIC_KEY_LEN;
+                        const char* tq = memchr(tp, '"',
+                            line_len - (size_t)(tp - rbuf));
+                        if (tq) {
+                            topic_start = tp;
+                            topic_len = (size_t)(tq - tp);
+                            if (_pollen_wf_topic_consumed(topic_start, topic_len)) {
+                                do_forward = 1;
+                            } else {
+                                do_ack = 0;  /* not for us, drop */
+                            }
+                        }
+                    }
+                }
+                if (mp && do_ack) {
                     mp += MID_KEY_LEN;
                     const char* mq = memchr(mp, '"',
                         line_len - (size_t)(mp - rbuf));
@@ -248,6 +437,32 @@ import Amalgame.String
                          * makes send return -1 with EPIPE instead
                          * of killing us with SIGPIPE. */
                         send(fd, ack, (size_t) ack_len, MSG_NOSIGNAL);
+                        /* Forward AFTER we ACK upstream — the
+                         * upstream publish-complete shouldn't wait
+                         * on the downstream forward. */
+                        if (do_forward) {
+                            if (_pollen_wf_n_nexts > 0) {
+                                _pollen_wf_forward_all(rbuf, line_len);
+                                fprintf(stdout,
+                                    "workflow: consumed topic=%.*s "
+                                    "msg=%.*s → forward to %d next-node(s)"
+                                    " (emit topic=%s)\n",
+                                    (int) topic_len, topic_start,
+                                    (int) midlen, mp,
+                                    _pollen_wf_n_nexts,
+                                    _pollen_wf_emit_topic[0] ? _pollen_wf_emit_topic : "(verbatim)");
+                            } else {
+                                /* terminal sink: consumed but no
+                                 * next list — log so the operator
+                                 * sees the message landed here. */
+                                fprintf(stdout,
+                                    "workflow: consumed topic=%.*s "
+                                    "msg=%.*s → terminal (sink)\n",
+                                    (int) topic_len, topic_start,
+                                    (int) midlen, mp);
+                            }
+                            fflush(stdout);
+                        }
                     }
                 }
                 size_t consumed = line_len + 1;
@@ -577,6 +792,52 @@ public class Program {
                                 let emiS: string = Program.JoinArr(emiV)
                                 let nxtS: string = Program.JoinArr(nxtV)
                                 Console.WriteLine("workflow: role={role}  consumes=[{conS}]  emits=[{emiS}]  next=[{nxtS}]")
+
+                                // ── Phase 3.1: register consumes ──
+                                if (conV.IsArray()) {
+                                    let conItems: List<JsonValue> = conV.AsArray()
+                                    let cn: int = conItems.Count()
+                                    for ci in 0..cn {
+                                        let cit: JsonValue = conItems.Get(ci)
+                                        let topic: string = cit.AsString()
+                                        @c { _pollen_wf_add_consume(topic); }
+                                    }
+                                }
+
+                                // ── Phase 3.2: register emit topic ──
+                                // First entry of `emits` is the topic
+                                // this node re-emits on (typical
+                                // workflow transformer pattern: consume
+                                // x.raw, emit x.cooked).
+                                if (emiV.IsArray()) {
+                                    let emiItems: List<JsonValue> = emiV.AsArray()
+                                    if (emiItems.Count() > 0) {
+                                        let etV: JsonValue = emiItems.Get(0)
+                                        let et: string = etV.AsString()
+                                        @c { _pollen_wf_set_emit_topic(et); }
+                                    }
+                                }
+
+                                // ── Phase 3.2: resolve next roles → host:port pairs ──
+                                if (nxtV.IsArray()) {
+                                    let nxtItems: List<JsonValue> = nxtV.AsArray()
+                                    let xn: int = nxtItems.Count()
+                                    for xi in 0..xn {
+                                        let xit: JsonValue = nxtItems.Get(xi)
+                                        let nextRole: string = xit.AsString()
+                                        let nextNode: JsonValue = nodesV.Get(nextRole)
+                                        if (nextNode.IsObject()) {
+                                            let nhV: JsonValue = nextNode.Get("host")
+                                            let npV: JsonValue = nextNode.Get("port")
+                                            let nh: string = nhV.AsString()
+                                            let np: int    = npV.AsInt()
+                                            @c { _pollen_wf_add_next(nh, (int) np); }
+                                            Console.WriteLine("workflow: route → {nextRole} at {nh}:{np}")
+                                        } else {
+                                            Console.WriteLine("workflow: warning — next '{nextRole}' not in nodes table")
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
