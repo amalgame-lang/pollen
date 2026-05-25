@@ -95,28 +95,16 @@ if ! grep -q "listening on TCP :$RECV_PORT" "$RECV_LOG" 2>/dev/null; then
 fi
 echo "  receiver pid=$RECV_PID port=$RECV_PORT"
 
-build_spec() {
-    local p_index=$1
-    local spec=""
-    local i=0
-    while [ $i -lt $M ]; do
-        local payload="{\"p\":$p_index,\"i\":$i}"
-        if [ -z "$spec" ]; then
-            spec="127.0.0.1:$RECV_PORT:$TOPIC:1:$payload"
-        else
-            spec="$spec;127.0.0.1:$RECV_PORT:$TOPIC:1:$payload"
-        fi
-        i=$((i + 1))
-    done
-    echo "$spec"
-}
-
-echo "  spawning $K publishers…"
+# ── Phase 2.4e: --burst flag bypasses the AM O(M) semicolon
+# parse. Each publisher gets one ip:port:topic:ver:data:count
+# spec and the C hot path handles all M iterations directly.
+echo "  spawning $K publishers (--burst path)…"
 PUB_PIDS=()
 T0=$(date +%s%N)
 for k in $(seq 1 "$K"); do
-    spec="$(build_spec "$k")"
-    "$NODE_BIN" 0 --publish "$spec" > "$TMP/pub-$k.log" 2>&1 &
+    payload="{\"p\":$k,\"i\":0}"
+    burst="127.0.0.1:$RECV_PORT:$TOPIC:1:$payload:$M"
+    "$NODE_BIN" 0 --burst "$burst" > "$TMP/pub-$k.log" 2>&1 &
     PUB_PIDS+=("$!")
 done
 
