@@ -979,47 +979,133 @@ import Amalgame.String
         b->n_targets++;
     }
 
+    /* Phase 5.2.1 — find the JSON value for a dotted path within a
+     * range. Walks segment-by-segment : for each segment, locate
+     * `"seg":` in the current range, parse past whitespace ; if not
+     * the last segment, ensure the value is an object `{...}` and
+     * narrow the range to its braces ; for the last segment, return
+     * a pointer + length covering the raw value (string contents
+     * without quotes, or full token for literals/numbers). Returns
+     * 0 on miss / type error. */
+    static int _pollen_resolve_path(const char* env, size_t env_len,
+                                     const char* path,
+                                     const char** out_val, size_t* out_len) {
+        const char* range_lo = env;
+        const char* range_hi = env + env_len;
+        const char* p = path;
+        for (;;) {
+            /* Pull one segment (up to next '.' or end). */
+            const char* dot = strchr(p, '.');
+            char seg[POLLEN_COND_VAR_MAX];
+            size_t seglen = dot ? (size_t)(dot - p) : strlen(p);
+            if (seglen == 0 || seglen + 4 >= sizeof(seg)) return 0;
+            seg[0] = '"';
+            memcpy(seg + 1, p, seglen);
+            seg[1 + seglen] = '"';
+            seg[2 + seglen] = ':';
+            int needle_len = (int)(seglen + 3);
+
+            const char* k = _pollen_find(range_lo, (size_t)(range_hi - range_lo),
+                                          seg, (size_t) needle_len);
+            if (!k) return 0;
+            const char* v = k + needle_len;
+            while (v < range_hi && (*v == ' ' || *v == '\t')) v++;
+            if (v >= range_hi) return 0;
+
+            int is_last = (dot == NULL);
+            if (!is_last) {
+                /* Must descend into an object. */
+                if (*v != '{') return 0;
+                /* Brace-count to find the matching '}'. */
+                int depth = 1;
+                const char* w = v + 1;
+                int in_str = 0;
+                while (w < range_hi && depth > 0) {
+                    char c = *w;
+                    if (in_str) {
+                        if (c == '\\' && w + 1 < range_hi) { w += 2; continue; }
+                        if (c == '"') in_str = 0;
+                    } else {
+                        if (c == '"') in_str = 1;
+                        else if (c == '{') depth++;
+                        else if (c == '}') depth--;
+                    }
+                    w++;
+                }
+                if (depth != 0) return 0;
+                range_lo = v + 1;
+                range_hi = w - 1;
+                p = dot + 1;
+                continue;
+            }
+
+            /* Last segment — return the raw value extent. For
+             * strings we strip the surrounding quotes ; for others
+             * we walk until a JSON-value terminator. */
+            if (*v == '"') {
+                const char* q = v + 1;
+                while (q < range_hi) {
+                    if (*q == '\\' && q + 1 < range_hi) { q += 2; continue; }
+                    if (*q == '"') break;
+                    q++;
+                }
+                if (q >= range_hi) return 0;
+                *out_val = v;            /* includes leading quote */
+                *out_len = (size_t)(q - v) + 1;
+                return 1;
+            }
+            const char* q = v;
+            while (q < range_hi
+                   && *q != ',' && *q != '}' && *q != ']'
+                   && *q != ' ' && *q != '\t' && *q != '\n' && *q != '\r') {
+                q++;
+            }
+            *out_val = v;
+            *out_len = (size_t)(q - v);
+            return 1;
+        }
+    }
+
     /* Evaluate one branch's condition against the envelope. */
     static int _pollen_cond_eval(pollen_cond_branch_t* b,
                                    const char* env, size_t env_len) {
         if (b->op == POLLEN_COND_NONE) return 1;  /* else / always */
 
-        /* Naive lookup : strip "data." prefix, search for
-         * "<key>": within the envelope. Works for top-level keys
-         * inside the data object. Phase 5.2.1 will add dotted
-         * path resolution. */
-        const char* path = b->var_path;
-        if (strncmp(path, "data.", 5) == 0) path += 5;
+        /* Phase 5.2.1 — dotted path resolution. `data.X` walks into
+         * the data object ; bare `X` looks at the envelope root. */
+        const char* val_ptr = NULL;
+        size_t val_len = 0;
+        if (!_pollen_resolve_path(env, env_len, b->var_path,
+                                    &val_ptr, &val_len)) return 0;
 
-        char needle[80];
-        int nlen = snprintf(needle, sizeof(needle), "\"%s\":", path);
-        if (nlen <= 0 || nlen >= (int) sizeof(needle)) return 0;
-
-        const char* k = _pollen_find(env, env_len, needle, (size_t) nlen);
-        if (!k) return 0;
-        const char* v = k + nlen;
-        while (v < env + env_len && (*v == ' ' || *v == '\t')) v++;
-        if (v >= env + env_len) return 0;
+        const char* v = val_ptr;
+        const char* v_end = val_ptr + val_len;
+        if (v >= v_end) return 0;
 
         double v_num = 0; int v_is_num = 0;
         char v_str[128] = "";
 
+        /* val_ptr/val_len cover the raw value extent : for strings,
+         * leading-quote + content + trailing-quote ; for numbers /
+         * literals, just the token. */
         if (*v == '"') {
-            v++;
-            const char* q = memchr(v, '"', env_len - (size_t)(v - env));
-            if (!q) return 0;
-            size_t slen = (size_t)(q - v);
+            const char* q = v_end - 1;
+            if (q <= v) return 0;
+            size_t slen = (size_t)(q - v - 1);
             if (slen >= sizeof(v_str)) slen = sizeof(v_str) - 1;
-            memcpy(v_str, v, slen);
+            memcpy(v_str, v + 1, slen);
             v_str[slen] = 0;
         } else if ((*v >= '0' && *v <= '9') || *v == '-' || *v == '+' || *v == '.') {
-            v_num = atof(v);
+            char tmp[64];
+            size_t cn = val_len < sizeof(tmp) - 1 ? val_len : sizeof(tmp) - 1;
+            memcpy(tmp, v, cn); tmp[cn] = 0;
+            v_num = atof(tmp);
             v_is_num = 1;
-        } else if (env + env_len - v >= 4 && memcmp(v, "true", 4) == 0) {
+        } else if (val_len == 4 && memcmp(v, "true", 4) == 0) {
             strcpy(v_str, "true");
-        } else if (env + env_len - v >= 5 && memcmp(v, "false", 5) == 0) {
+        } else if (val_len == 5 && memcmp(v, "false", 5) == 0) {
             strcpy(v_str, "false");
-        } else if (env + env_len - v >= 4 && memcmp(v, "null", 4) == 0) {
+        } else if (val_len == 4 && memcmp(v, "null", 4) == 0) {
             strcpy(v_str, "null");
         } else {
             return 0;
