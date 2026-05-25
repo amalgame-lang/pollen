@@ -108,9 +108,7 @@ filtering or auto-route on emit).
 | **3.3** ✅ | Hot-reload via mtime polling watcher thread. Re-read workflow.json when its mtime changes; atomic swap under mutex. |
 | **3.4** ✅ | parentMessageId chaining: forwarded envelopes get a fresh messageId, and `,"parentMessageId":"<previous>"` is appended so any downstream node can walk back to the producer. Hot-path log distinguishes `(root)` (no parent) from `parent=<uuid>` (descendant). |
 | **3.5** ✅ | sharedDir/executions/ persistent state. Pass `--shared-dir <path>`; each node writes one record per MESSAGE it touches under `<path>/executions/<mid>-<role>.json`. Same-mid records from emitter + consumer coexist (different `role`); chain walk reads `parentMessageId` and re-globs. |
-| 4 | Mosaic web-based workflow designer (WYSIWYG drag-and-drop, per
-the user notes). Edits workflow.json, broadcasts a SYNC packet
-to all listed nodes to trigger their reload. |
+| 4 | **Pollen Manager** — separate repo `amalgame-lang/pollen-manager`, Mosaic web app. WYSIWYG drag-and-drop designer for workflow.json, plus a live dashboard reading `sharedDir/executions/`. Edits broadcast SYNC packets to listed nodes to trigger their reload. |
 
 ## Wire envelope (recap)
 
