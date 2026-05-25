@@ -360,6 +360,20 @@ public class Program {
         Console.WriteLine("pollen-node: listening on UDP :{actualPort}")
         Console.WriteLine("pollen-node: JSON wire, dedup window = 7500 ms")
 
+        // Ask the kernel for 16 MiB of receive buffer (default in
+        // amc v0.8.53 is 8 MiB, but Linux silently clamps to
+        // net.core.rmem_max ≈ 208 KiB on stock distros). If we get
+        // less than ~1 MiB, surface the constraint so operators
+        // know they need to bump the sysctl for high-burst loads:
+        //   sudo sysctl -w net.core.rmem_max=16777216
+        let granted = UdpSocket_SetRecvBuf(sock, 16 * 1024 * 1024)
+        if (granted < 1024 * 1024) {
+            Console.WriteLine("pollen-node: WARN SO_RCVBUF clamped to {granted} bytes by kernel (net.core.rmem_max)")
+            Console.WriteLine("pollen-node:      bursts may overflow; bump with: sudo sysctl -w net.core.rmem_max=16777216")
+        } else {
+            Console.WriteLine("pollen-node: SO_RCVBUF = {granted} bytes")
+        }
+
         // Phase 1.5: optional sharedDir scan at startup.
         if (String_Length(sharedDir) > 0) {
             Console.WriteLine("pollen-node: sharedDir = {sharedDir}")
