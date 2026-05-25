@@ -33,6 +33,7 @@ import Amalgame.Net
 import Amalgame.Formats.Json
 import Amalgame.DateTime
 import Amalgame.Random
+import Amalgame.Threading
 import Amalgame.Collections
 import Amalgame.String
 
@@ -353,78 +354,85 @@ public class Program {
             }
         }
 
-        // Server accept loop. Each accepted conn is long-lived: we
-        // loop on TcpConn_Receive, buffer chunks, split on '\n',
-        // process each complete line. Null recv = peer closed → we
-        // close our end and go back to accept.
-        //
-        // Still single-thread: K publishers serialise here. Phase 2.2
-        // spawns a worker thread per accept via amalgame-threading.
+        // Server accept loop with one worker thread per connection
+        // (Phase 2.2). The closure body owns the conn it captured
+        // and runs the full long-lived recv loop on it — main thread
+        // races back to accept(). K concurrent peers handled in
+        // parallel without serialising on the accept().
         while (true) {
             let conn = TcpServer_Accept(server)
             if (!conn.Connected) {
                 continue
             }
+            // Pre-extract struct fields BEFORE the closure spawn —
+            // amc loses the AmalgameTcpConn type when conn is
+            // captured by a closure (treats it as i64 and the
+            // '->RemoteIp' access fails to type-check). Only
+            // TcpConn_Receive/Send tolerate the i64-as-pointer
+            // capture because they take pointer args and -Wno-
+            // int-conversion lets gcc emit the implicit cast.
             let fromIp:   string = conn.RemoteIp
             let fromPort: int    = conn.RemotePort
-            var rbuf: string = ""
-            var closed: bool = false
-            while (!closed) {
-                let chunk: string = TcpConn_Receive(conn, 8192)
-                if (chunk == null) {
-                    closed = true
-                    continue
-                }
-                rbuf = rbuf + chunk
-                // Drain all complete lines in rbuf
-                var nlPos: int = String_IndexOf(rbuf, "\n")
-                while (nlPos >= 0) {
-                    let line: string = String_Substring(rbuf, 0, nlPos)
-                    let rest: int    = String_Length(rbuf) - nlPos - 1
-                    rbuf = String_Substring(rbuf, nlPos + 1, rest)
-                    let plen: int = String_Length(line)
-                    let parser: JsonParser = new JsonParser(line)
-                    let env: JsonValue     = parser.ParseTopLevel()
-                    if (parser.HasFailed()) {
-                        let pmsg: string = parser.ErrorMsg()
-                        Console.WriteLine("recv {plen} bytes from {fromIp}:{fromPort} — JSON parse failed: {pmsg}")
-                    } else {
-                        if (!env.IsObject()) {
-                            Console.WriteLine("recv {plen} bytes from {fromIp}:{fromPort} — envelope not an object")
+            let handler = (arg: int) => {
+                var rbuf: string = ""
+                var closed: bool = false
+                while (!closed) {
+                    let chunk: string = TcpConn_Receive(conn, 8192)
+                    if (chunk == null) {
+                        closed = true
+                        continue
+                    }
+                    rbuf = rbuf + chunk
+                    var nlPos: int = String_IndexOf(rbuf, "\n")
+                    while (nlPos >= 0) {
+                        let line: string = String_Substring(rbuf, 0, nlPos)
+                        let rest: int    = String_Length(rbuf) - nlPos - 1
+                        rbuf = String_Substring(rbuf, nlPos + 1, rest)
+                        let plen: int = String_Length(line)
+                        let parser: JsonParser = new JsonParser(line)
+                        let env: JsonValue     = parser.ParseTopLevel()
+                        if (parser.HasFailed()) {
+                            let pmsg: string = parser.ErrorMsg()
+                            Console.WriteLine("recv {plen} bytes from {fromIp}:{fromPort} — JSON parse failed: {pmsg}")
                         } else {
-                            let typeV: JsonValue = env.Get("type")
-                            let mtype: string = typeV.AsString()
-                            if (mtype == "MESSAGE") {
-                                let midV: JsonValue = env.Get("messageId")
-                                let mid: string = midV.AsString()
-                                if (String_Length(mid) == 0) {
-                                    Console.WriteLine("recv MESSAGE from {fromIp}:{fromPort} — missing messageId, dropping")
-                                } else {
-                                    let topicV: JsonValue = env.Get("topic")
-                                    let topicSum: string = Program.TopicSummary(topicV)
-                                    let now: int = Program.NowMs()
-                                    Console.WriteLine("recv MESSAGE {mid} topic={topicSum} from {fromIp}:{fromPort} bytes={plen}")
-                                    let ackBody: string = Program.EncodeAck(mid, now)
-                                    TcpConn_Send(conn, ackBody + "\n")
-                                }
+                            if (!env.IsObject()) {
+                                Console.WriteLine("recv {plen} bytes from {fromIp}:{fromPort} — envelope not an object")
                             } else {
-                                if (mtype == "SYNCHRONIZATION") {
-                                    let etV: JsonValue = env.Get("entityType")
-                                    let euV: JsonValue = env.Get("uuid")
-                                    let et: string = etV.AsString()
-                                    let eu: string = euV.AsString()
-                                    Console.WriteLine("recv SYNC from {fromIp}:{fromPort} {et}={eu}")
+                                let typeV: JsonValue = env.Get("type")
+                                let mtype: string = typeV.AsString()
+                                if (mtype == "MESSAGE") {
+                                    let midV: JsonValue = env.Get("messageId")
+                                    let mid: string = midV.AsString()
+                                    if (String_Length(mid) == 0) {
+                                        Console.WriteLine("recv MESSAGE from {fromIp}:{fromPort} — missing messageId, dropping")
+                                    } else {
+                                        let topicV: JsonValue = env.Get("topic")
+                                        let topicSum: string = Program.TopicSummary(topicV)
+                                        let now: int = Program.NowMs()
+                                        Console.WriteLine("recv MESSAGE {mid} topic={topicSum} from {fromIp}:{fromPort} bytes={plen}")
+                                        let ackBody: string = Program.EncodeAck(mid, now)
+                                        TcpConn_Send(conn, ackBody + "\n")
+                                    }
                                 } else {
-                                    Console.WriteLine("recv unknown type='{mtype}' from {fromIp}:{fromPort} — dropping")
+                                    if (mtype == "SYNCHRONIZATION") {
+                                        let etV: JsonValue = env.Get("entityType")
+                                        let euV: JsonValue = env.Get("uuid")
+                                        let et: string = etV.AsString()
+                                        let eu: string = euV.AsString()
+                                        Console.WriteLine("recv SYNC from {fromIp}:{fromPort} {et}={eu}")
+                                    } else {
+                                        Console.WriteLine("recv unknown type='{mtype}' from {fromIp}:{fromPort} — dropping")
+                                    }
                                 }
                             }
                         }
+                        Console.Flush()
+                        nlPos = String_IndexOf(rbuf, "\n")
                     }
-                    Console.Flush()
-                    nlPos = String_IndexOf(rbuf, "\n")
                 }
+                TcpConn_Close(conn)
             }
-            TcpConn_Close(conn)
+            Threading.ThreadSpawn(handler, 0)
         }
     }
 }
