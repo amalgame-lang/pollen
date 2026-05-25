@@ -1,4 +1,4 @@
-// Pollen — UDP node daemon (Phase 1.5b: + publish API w/ retry)
+// Pollen — UDP node daemon (Phase 1.5c: + 2-thread split)
 //
 // Wire-compatible with TARMeule v1: parses + emits JSON envelopes:
 //
@@ -36,6 +36,7 @@ import Amalgame.Net
 import Amalgame.Formats.Json
 import Amalgame.DateTime
 import Amalgame.Random
+import Amalgame.Threading
 import Amalgame.Collections
 import Amalgame.String
 
@@ -61,6 +62,27 @@ public class DedupEntry {
 // Re-sent every ackTimeoutMs until either a matching ACK arrives
 // (removed via PendingRemove) or maxAttempts is reached (emits a
 // 'publish timeout' log + removed).
+
+// ── Inbound packet handed from acceptor → processor (Phase 1.5c)
+//
+// Lives in a Channel<WorkItem*>. The acceptor thread does only
+// the tight `recvfrom` loop and pushes each datagram here; the
+// main (processor) thread drains the channel, parses, dispatches.
+// Splitting the work this way drains the kernel UDP buffer faster
+// under load — the heavy JSON-parse path no longer gates the next
+// recvfrom call.
+
+public class WorkItem {
+    public Data:     string
+    public FromIp:   string
+    public FromPort: int
+
+    public WorkItem(string d, string ip, int p) {
+        this.Data     = d
+        this.FromIp   = ip
+        this.FromPort = p
+    }
+}
 
 public class PendingMessage {
     public MessageId: string
@@ -445,10 +467,38 @@ public class Program {
             Console.Flush()
         }
 
-        // Receive loop. 200 ms timeout lets the pending-ACK retry
-        // sweep interleave without burning CPU.
+        // ── 2-thread split (Phase 1.5c) ─────────────────
+        // Spawn an acceptor that hammers UdpSocket.ReceiveFrom in a
+        // tight loop and pushes each datagram into a Channel. The
+        // main loop below stops doing recvfrom and instead drains
+        // the channel — keeps the heavy JSON-parse work off the
+        // kernel-buffer-drain critical path.
+        //
+        // Channel capacity is a soft backpressure knob — too small
+        // and the acceptor blocks under burst; too large and we
+        // hoard WorkItem allocations the GC can't reclaim fast
+        // enough on a tight VM. 2048 holds the K=8 M=500 working
+        // set comfortably (~400 KB peak) while still applying
+        // backpressure under heavier concurrency (K≥16 on a small
+        // VM stresses the process count more than the channel,
+        // but a smaller cap surfaces the saturation earlier
+        // instead of OOMing the host).
+        let packetCh = Threading.ChannelNew(2048)
+        let acceptor = (arg: int) => {
+            while (true) {
+                let dg = UdpSocket_ReceiveFrom(sock, 65536, 100)
+                if (dg != null) {
+                    let item = new WorkItem(dg.Data, dg.FromIp, dg.FromPort)
+                    Threading.ChannelSend(packetCh, item)
+                }
+            }
+        }
+        Threading.ThreadSpawn(acceptor, 0)
+
+        // Main processing loop. Drains the channel + interleaves
+        // dedup GC + pending retry sweep. ThreadSleep(10) keeps
+        // CPU at bay when the channel runs dry.
         while (true) {
-            let dg = UdpSocket_ReceiveFrom(sock, 65536, 200)
             let now: int = Program.NowMs()
             Program.DedupGC(dedup, now)
 
@@ -484,96 +534,93 @@ public class Program {
             // see retries until the process exits.
             if (pendingTouched) { Console.Flush() }
 
-            if (dg == null) { continue }
-
-            let payload: string = dg.Data
-            let fromIp:  string = dg.FromIp
-            let fromPort: int   = dg.FromPort
-
-            // Parse envelope. Drop malformed datagrams silently
-            // (Phase 1.x will count them via /metrics; v0.1 just
-            // prints a warning).
-            // Use JsonParser directly. The static `Json.Parse`
-            // returns JsonResult which amc's cgen mis-namespaces
-            // (Pollen_Node_JsonResult vs Amalgame_Formats_Json_…)
-            // — to be fixed in a future amc release. JsonParser's
-            // ParseTopLevel() returns a well-known JsonValue so
-            // the resolver stays happy.
-            let parser: JsonParser = new JsonParser(payload)
-            let env: JsonValue     = parser.ParseTopLevel()
-            if (parser.HasFailed()) {
-                let pmsg: string = parser.ErrorMsg()
-                Console.WriteLine("recv {dg.DataLen} bytes from {fromIp}:{fromPort} — JSON parse failed: {pmsg}")
+            // Drain whatever the acceptor pushed since last tick.
+            // ChannelCount() peeks the buffered depth; the typed
+            // `let pkt: WorkItem = ...Receive(...)` cast relies on
+            // amc's pointer-erasure round-trip (verified for both
+            // strings and AM class instances on the channel).
+            let depth: int = Threading.ChannelCount(packetCh)
+            if (depth <= 0) {
+                Threading.ThreadSleep(10)
                 continue
             }
-            if (!env.IsObject()) {
-                Console.WriteLine("recv {dg.DataLen} bytes from {fromIp}:{fromPort} — envelope not an object")
-                continue
-            }
+            var di: int = 0
+            while (di < depth) {
+                let pkt: WorkItem = Threading.ChannelReceive(packetCh)
+                let payload: string = pkt.Data
+                let fromIp:  string = pkt.FromIp
+                let fromPort: int   = pkt.FromPort
+                let plen: int       = String_Length(payload)
+                di = di + 1
 
-            let typeV: JsonValue = env.Get("type")
-            let mtype: string = typeV.AsString()
-
-            if (mtype == "ACK") {
-                let midV: JsonValue = env.Get("messageId")
-                let mid: string = midV.AsString()
-                let matched: bool = Program.PendingRemove(pending, mid)
-                if (matched) {
-                    Console.WriteLine("recv ACK from {fromIp}:{fromPort} for {mid} (publish complete) ts={now}")
+                // ── parse envelope ──
+                let parser: JsonParser = new JsonParser(payload)
+                let env: JsonValue     = parser.ParseTopLevel()
+                if (parser.HasFailed()) {
+                    let pmsg: string = parser.ErrorMsg()
+                    Console.WriteLine("recv {plen} bytes from {fromIp}:{fromPort} — JSON parse failed: {pmsg}")
+                    Console.Flush()
                 } else {
-                    Console.WriteLine("recv ACK from {fromIp}:{fromPort} for {mid} (no pending match) ts={now}")
+                    if (!env.IsObject()) {
+                        Console.WriteLine("recv {plen} bytes from {fromIp}:{fromPort} — envelope not an object")
+                        Console.Flush()
+                    } else {
+                        let typeV: JsonValue = env.Get("type")
+                        let mtype: string = typeV.AsString()
+                        if (mtype == "ACK") {
+                            let midV: JsonValue = env.Get("messageId")
+                            let mid: string = midV.AsString()
+                            let matched: bool = Program.PendingRemove(pending, mid)
+                            if (matched) {
+                                Console.WriteLine("recv ACK from {fromIp}:{fromPort} for {mid} (publish complete) ts={now}")
+                            } else {
+                                Console.WriteLine("recv ACK from {fromIp}:{fromPort} for {mid} (no pending match) ts={now}")
+                            }
+                            Console.Flush()
+                        } else {
+                            if (mtype == "SYNCHRONIZATION") {
+                                let etV: JsonValue = env.Get("entityType")
+                                let euV: JsonValue = env.Get("uuid")
+                                let et: string = etV.AsString()
+                                let eu: string = euV.AsString()
+                                Console.WriteLine("recv SYNC from {fromIp}:{fromPort} {et}={eu}")
+                                if (String_Length(sharedDir) > 0) {
+                                    Program.ReloadEntity(sharedDir, et, eu)
+                                }
+                                Console.Flush()
+                            } else {
+                                if (mtype == "MESSAGE") {
+                                    let midV: JsonValue = env.Get("messageId")
+                                    let mid: string = midV.AsString()
+                                    if (String_Length(mid) == 0) {
+                                        Console.WriteLine("recv MESSAGE from {fromIp}:{fromPort} — missing messageId, dropping")
+                                        Console.Flush()
+                                    } else {
+                                        let topicV: JsonValue = env.Get("topic")
+                                        let topicSum: string = Program.TopicSummary(topicV)
+                                        let already: bool = Program.DedupSeen(dedup, mid)
+                                        if (already) {
+                                            Console.WriteLine("recv MESSAGE dup {mid} topic={topicSum} from {fromIp}:{fromPort} — re-ACK only")
+                                        } else {
+                                            Program.DedupAdd(dedup, mid, now)
+                                            Console.WriteLine("recv MESSAGE {mid} topic={topicSum} from {fromIp}:{fromPort} bytes={plen}")
+                                        }
+                                        let ackBody: string = Program.EncodeAck(mid, now)
+                                        let sent: bool = UdpSocket_Send(sock, fromIp, fromPort, ackBody)
+                                        if (!sent) {
+                                            Console.WriteLine("send ACK failed to {fromIp}:{fromPort}")
+                                        }
+                                        Console.Flush()
+                                    }
+                                } else {
+                                    Console.WriteLine("recv unknown type='{mtype}' from {fromIp}:{fromPort} — dropping")
+                                    Console.Flush()
+                                }
+                            }
+                        }
+                    }
                 }
-                Console.Flush()
-                continue
             }
-
-            if (mtype == "SYNCHRONIZATION") {
-                let etV: JsonValue = env.Get("entityType")
-                let euV: JsonValue = env.Get("uuid")
-                let et: string = etV.AsString()
-                let eu: string = euV.AsString()
-                Console.WriteLine("recv SYNC from {fromIp}:{fromPort} {et}={eu}")
-                // Phase 1.5: reload the corresponding file from
-                // sharedDir if one was configured at startup.
-                if (String_Length(sharedDir) > 0) {
-                    Program.ReloadEntity(sharedDir, et, eu)
-                }
-                Console.Flush()
-                continue
-            }
-
-            if (mtype == "MESSAGE") {
-                let midV: JsonValue = env.Get("messageId")
-                let mid: string = midV.AsString()
-                if (String_Length(mid) == 0) {
-                    Console.WriteLine("recv MESSAGE from {fromIp}:{fromPort} — missing messageId, dropping")
-                    continue
-                }
-
-                let topicV: JsonValue = env.Get("topic")
-                let topicSum: string = Program.TopicSummary(topicV)
-
-                // Dedup: ACK either way, dispatch only on first sight.
-                let already: bool = Program.DedupSeen(dedup, mid)
-                if (already) {
-                    Console.WriteLine("recv MESSAGE dup {mid} topic={topicSum} from {fromIp}:{fromPort} — re-ACK only")
-                } else {
-                    Program.DedupAdd(dedup, mid, now)
-                    Console.WriteLine("recv MESSAGE {mid} topic={topicSum} from {fromIp}:{fromPort} bytes={dg.DataLen}")
-                    // Phase 1.5+ will dispatch to a per-topic handler here.
-                }
-
-                let ackBody: string = Program.EncodeAck(mid, now)
-                let sent: bool = UdpSocket_Send(sock, fromIp, fromPort, ackBody)
-                if (!sent) {
-                    Console.WriteLine("send ACK failed to {fromIp}:{fromPort}")
-                }
-                Console.Flush()
-                continue
-            }
-
-            Console.WriteLine("recv unknown type='{mtype}' from {fromIp}:{fromPort} — dropping")
-            Console.Flush()
         }
     }
 }
