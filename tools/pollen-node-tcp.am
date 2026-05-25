@@ -1519,6 +1519,99 @@ public class Program {
         return out
     }
 
+    // ── Phase 5.1 — workflow.json `tree` walker ──
+    //
+    // When the v2 schema includes a `tree` field, routing is
+    // driven by the tree instead of per-node `next` arrays. For
+    // this first slab we support :
+    //
+    //   {"type":"call",     "node":"<role>"}
+    //   {"type":"fan_out",  "nodes":["<role>", …]}
+    //   {"type":"sequence", "steps":[<Action>, <Action>, …]}
+    //   {"type":"end"}
+    //
+    // Semantics map to the v1 flat-DAG behaviour (per-node next):
+    // when role X is called at sequence step i, X's outgoing edges
+    // are the targets of sequence step i+1 (the "what comes next").
+    // If no next step, X is terminal. Phase 5.2 will add nested
+    // `if` ; Phase 5.4 will add `while` + `for` with the full
+    // treePath walker.
+
+    // Does this Action name `role` as a call target or fan_out target?
+    public static bool StepNames(JsonValue actionV, string role) {
+        if (!actionV.IsObject()) { return false }
+        let kind: string = actionV.Get("type").AsString()
+        if (kind == "call") {
+            return actionV.Get("node").AsString() == role
+        }
+        if (kind == "fan_out") {
+            let nodesV: JsonValue = actionV.Get("nodes")
+            if (!nodesV.IsArray()) { return false }
+            let nodes: List<JsonValue> = nodesV.AsArray()
+            let n: int = nodes.Count()
+            for i in 0..n {
+                if (nodes.Get(i).AsString() == role) { return true }
+            }
+        }
+        return false
+    }
+
+    // The list of node names this Action would dispatch to. For
+    // call → [node]. For fan_out → nodes[]. For end / sequence →
+    // empty (sequence is itself a list, not a dispatcher).
+    public static List<string> ActionTargets(JsonValue actionV) {
+        let out: List<string> = new List<string>()
+        if (!actionV.IsObject()) { return out }
+        let kind: string = actionV.Get("type").AsString()
+        if (kind == "call") {
+            let nV: string = actionV.Get("node").AsString()
+            if (String_Length(nV) > 0) { out.Add(nV) }
+            return out
+        }
+        if (kind == "fan_out") {
+            let nodesV: JsonValue = actionV.Get("nodes")
+            if (!nodesV.IsArray()) { return out }
+            let nodes: List<JsonValue> = nodesV.AsArray()
+            let n: int = nodes.Count()
+            for i in 0..n {
+                let s: string = nodes.Get(i).AsString()
+                if (String_Length(s) > 0) { out.Add(s) }
+            }
+        }
+        return out
+    }
+
+    // Find the "next" targets after `role` in the tree. Walks one
+    // level of sequence — Phase 5.4 will extend for nested
+    // structures + while/for loops.
+    public static List<string> FindActionAfter(JsonValue treeV, string role) {
+        let out: List<string> = new List<string>()
+        if (!treeV.IsObject()) { return out }
+        let kind: string = treeV.Get("type").AsString()
+        // Top-level sequence : iterate steps, find the one that
+        // names role, return the targets of the next step.
+        if (kind == "sequence") {
+            let stepsV: JsonValue = treeV.Get("steps")
+            if (!stepsV.IsArray()) { return out }
+            let steps: List<JsonValue> = stepsV.AsArray()
+            let n: int = steps.Count()
+            for i in 0..n {
+                let step: JsonValue = steps.Get(i)
+                if (Program.StepNames(step, role)) {
+                    if (i + 1 < n) {
+                        return Program.ActionTargets(steps.Get(i + 1))
+                    }
+                    return out  // terminal — role is the last step
+                }
+            }
+            return out
+        }
+        // Top-level single call/fan_out : role gets no next, since
+        // there's nothing after.
+        if (Program.StepNames(treeV, role)) { return out }
+        return out
+    }
+
     public static bool LoadWorkflow(string workflowPath, string nodeName, int actualPort) {
         if (!File_Exists(workflowPath)) {
             Console.WriteLine("workflow: file not found: {workflowPath}")
@@ -1595,7 +1688,33 @@ public class Program {
                 @c { _pollen_wf_set_emit_topic(et); }
             }
         }
-        if (nxtV.IsArray()) {
+        // Phase 5.1 — if the workflow has a `tree`, derive next[]
+        // from it. Otherwise fall back to the node's own `next`
+        // array (v1 + v2-without-tree behaviour).
+        let treeV: JsonValue = root.Get("tree")
+        let hasTree: bool = treeV.IsObject()
+        var nxtSrcTag: string = "node.next"
+        var nxtSReal: string = nxtS
+        if (hasTree) {
+            nxtSrcTag = "tree"
+            let treeTargets: List<string> = Program.FindActionAfter(treeV, role)
+            let tn: int = treeTargets.Count()
+            var inner: string = ""
+            for ti in 0..tn {
+                let nextRole: string = treeTargets.Get(ti)
+                if (String_Length(inner) > 0) { inner = inner + "," }
+                inner = inner + nextRole
+                let nextNode: JsonValue = Program.FindNodeByKey(nodesV, nextRole)
+                if (nextNode.IsObject()) {
+                    let nhV: JsonValue = nextNode.Get("host")
+                    let npV: JsonValue = nextNode.Get("port")
+                    let nh: string = nhV.AsString()
+                    let np: int    = npV.AsInt()
+                    @c { _pollen_wf_add_next(nh, (int) np); }
+                }
+            }
+            nxtSReal = inner
+        } else if (nxtV.IsArray()) {
             let nxtItems: List<JsonValue> = nxtV.AsArray()
             let xn: int = nxtItems.Count()
             for xi in 0..xn {
@@ -1614,7 +1733,7 @@ public class Program {
         @c { _pollen_wf_reload_commit(); }
         var schemaTag: string = "v1"
         if (isV2) { schemaTag = "v2" }
-        Console.WriteLine("workflow: loaded '{wfName}' v{wfVer} ({schemaTag}) role={role} consumes=[{conS}] emits=[{emiS}] next=[{nxtS}]")
+        Console.WriteLine("workflow: loaded '{wfName}' v{wfVer} ({schemaTag}) role={role} consumes=[{conS}] emits=[{emiS}] next=[{nxtSReal}] (next from {nxtSrcTag})")
         Console.Flush()
         return true
     }
