@@ -108,6 +108,20 @@ DT_LIB="$DT_CACHE_BASE/$DT_VER/build/linux-x86_64/libamalgame-pkg-DateTime.a"
 [ -f "$DT_FACADE" ] || die "datetime facade.am missing at $DT_FACADE"
 [ -f "$DT_LIB" ]    || die "datetime build archive missing at $DT_LIB — try \`amc package add datetime\` again"
 
+# amalgame-random — used by pollen-client for RFC 4122 v4 UUIDs.
+# Crypto-grade SystemBytes(16) + version/variant bit fix gives a
+# TARMeule-compatible messageId without per-call shell-outs.
+RND_CACHE_BASE="$HOME/.amalgame/packages/github.com/amalgame-lang/amalgame-random"
+if [ ! -d "$RND_CACHE_BASE" ]; then
+    die "amalgame-random not installed in the package cache. Run \`amc package add random\` first."
+fi
+RND_VER=$(ls -1 "$RND_CACHE_BASE" 2>/dev/null | sort -V | tail -1)
+[ -n "$RND_VER" ] || die "amalgame-random cache empty"
+RND_FACADE="$RND_CACHE_BASE/$RND_VER/facade.am"
+RND_LIB="$RND_CACHE_BASE/$RND_VER/build/linux-x86_64/libamalgame-pkg-Random.a"
+[ -f "$RND_FACADE" ] || die "random facade.am missing at $RND_FACADE"
+[ -f "$RND_LIB" ]    || die "random build archive missing at $RND_LIB — try \`amc package add random\` again"
+
 # Compile pollen-node.am with json.am + datetime facade as extra
 # sources so JsonParser / DateTime class methods resolve.
 (cd "$BUILD_DIR" && "$AMC" -o pollen-node \
@@ -143,11 +157,12 @@ say "Compiling pollen-client…"
     "$SRC_DIR/tools/pollen-client.am" \
     "$AMC_STDLIB/json.am" \
     "$DT_FACADE" \
+    "$RND_FACADE" \
     --quiet)
 [ -f "$BUILD_DIR/pollen-client.c" ] || die "amc didn't produce pollen-client.c"
 
 gcc -O2 -I"$AMC_RUNTIME" $PKG_INCS "$BUILD_DIR/pollen-client.c" \
-    "$DT_LIB" -lgc -lm -lz -ldl -lpthread \
+    "$DT_LIB" "$RND_LIB" -lgc -lm -lz -ldl -lpthread \
     -o "$BUILD_DIR/pollen-client-bin" \
     || die "gcc link failed (pollen-client)"
 
