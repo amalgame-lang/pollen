@@ -315,6 +315,26 @@ public class Program {
                "\"timestamp\":" + ts + "}"
     }
 
+    // Comma-join the strings of a JSON array. Returns "" if the
+    // value isn't an array (so a missing 'consumes' / 'emits' /
+    // 'next' field renders as empty brackets rather than crashing).
+    public static string JoinArr(JsonValue v) {
+        if (!v.IsArray()) { return "" }
+        let items: List<JsonValue> = v.AsArray()
+        let n: int = items.Count()
+        var out: string = ""
+        for i in 0..n {
+            let it: JsonValue = items.Get(i)
+            let s: string = it.AsString()
+            if (i == 0) {
+                out = s
+            } else {
+                out = out + "," + s
+            }
+        }
+        return out
+    }
+
     public static string TopicSummary(JsonValue topic) {
         if (!topic.IsObject()) { return "?" }
         let uuidV:    JsonValue = topic.Get("uuid")
@@ -416,6 +436,14 @@ public class Program {
         // that bypasses the AM-side O(M) semicolon parse and calls
         // pollen_hot_publish_stream once for the whole batch.
         var burstSpec:   string = ""
+        // --workflow <path> + --node-name <role> — Phase 3.0
+        // workflow.json self-identification. The node reads the
+        // JSON, finds its role (by --node-name override or by
+        // matching host:port), and logs consume/emit/next lists.
+        // Runtime dispatch (consume filtering + auto-emit) is
+        // deferred to Phase 3.1+; the hot path stays unchanged.
+        var workflowPath: string = ""
+        var nodeName:     string = ""
 
         var i: int = 1
         while (i < Args_Count()) {
@@ -440,6 +468,24 @@ public class Program {
                     continue
                 }
                 Console.WriteLine("pollen-node-tcp: --burst needs ip:port:uuid:ver:data:count")
+                return
+            }
+            if (a == "--workflow") {
+                if (i + 1 < Args_Count()) {
+                    workflowPath = Args_Get(i + 1)
+                    i = i + 2
+                    continue
+                }
+                Console.WriteLine("pollen-node-tcp: --workflow needs a file path")
+                return
+            }
+            if (a == "--node-name") {
+                if (i + 1 < Args_Count()) {
+                    nodeName = Args_Get(i + 1)
+                    i = i + 2
+                    continue
+                }
+                Console.WriteLine("pollen-node-tcp: --node-name needs a role name")
                 return
             }
             if (port == 5000) {
@@ -469,6 +515,75 @@ public class Program {
         }
         Console.WriteLine("pollen-node-tcp: wire = JSON\\n-delim, transport = long-lived TCP (v0.2.0-dev Phase 2.1)")
         Console.Flush()
+
+        // ── Phase 3.0: workflow.json self-identification ──
+        if (String_Length(workflowPath) > 0) {
+            if (!File_Exists(workflowPath)) {
+                Console.WriteLine("workflow: file not found: {workflowPath}")
+            } else {
+                let body: string = File_ReadAll(workflowPath)
+                let parser: JsonParser = new JsonParser(body)
+                let root: JsonValue    = parser.ParseTopLevel()
+                if (parser.HasFailed()) {
+                    let emsg: string = parser.ErrorMsg()
+                    Console.WriteLine("workflow: parse failed: {emsg}")
+                } else {
+                    let wfNameV: JsonValue = root.Get("name")
+                    let wfVerV:  JsonValue = root.Get("version")
+                    let wfName:  string = wfNameV.AsString()
+                    let wfVer:   int    = wfVerV.AsInt()
+                    Console.WriteLine("workflow: loaded '{wfName}' v{wfVer} from {workflowPath}")
+                    let nodesV: JsonValue = root.Get("nodes")
+                    if (!nodesV.IsObject()) {
+                        Console.WriteLine("workflow: 'nodes' missing or not an object")
+                    } else {
+                        // Determine our role: --node-name override
+                        // beats host:port matching. Host matching on
+                        // loopback / single-host setups isn't
+                        // useful (every role has same host), so
+                        // --node-name is the recommended path for
+                        // smoke tests.
+                        var role: string = nodeName
+                        if (String_Length(role) == 0) {
+                            let nodeKeys: List<string> = nodesV.Keys()
+                            let nk: int = nodeKeys.Count()
+                            for ki in 0..nk {
+                                let key: string = nodeKeys.Get(ki)
+                                let entry: JsonValue = nodesV.Get(key)
+                                let hV: JsonValue = entry.Get("host")
+                                let pV: JsonValue = entry.Get("port")
+                                let h: string = hV.AsString()
+                                let p: int    = pV.AsInt()
+                                if (p == actualPort) {
+                                    // Best-effort: any host with the
+                                    // right port wins on loopback.
+                                    // Production: match actual hostname.
+                                    role = key
+                                    break
+                                }
+                            }
+                        }
+                        if (String_Length(role) == 0) {
+                            Console.WriteLine("workflow: no role matches port :{actualPort}; running in free-form mode")
+                        } else {
+                            let me: JsonValue = nodesV.Get(role)
+                            if (!me.IsObject()) {
+                                Console.WriteLine("workflow: role '{role}' not in nodes")
+                            } else {
+                                let conV: JsonValue = me.Get("consumes")
+                                let emiV: JsonValue = me.Get("emits")
+                                let nxtV: JsonValue = me.Get("next")
+                                let conS: string = Program.JoinArr(conV)
+                                let emiS: string = Program.JoinArr(emiV)
+                                let nxtS: string = Program.JoinArr(nxtV)
+                                Console.WriteLine("workflow: role={role}  consumes=[{conS}]  emits=[{emiS}]  next=[{nxtS}]")
+                            }
+                        }
+                    }
+                }
+            }
+            Console.Flush()
+        }
 
         // ── --burst fast path (Phase 2.4e) ────────────────
         // Single split on ':' (5 fields + count), one call into the
