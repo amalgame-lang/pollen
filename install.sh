@@ -93,11 +93,27 @@ else
 fi
 [ -f "$AMC_STDLIB/json.am" ] || die "cannot locate $AMC_STDLIB/json.am (Pollen needs JSON parsing)"
 
-# Compile pollen-node.am with json.am as an extra source so the
-# JsonParser / JsonValue / Json class methods link.
+# Locate amalgame-datetime in the package cache. Pollen needs
+# DateTime.NowNanos() for timestamps + retry deadlines (previous
+# iterations shelled out to `date +%s%3N` which was 1-3 ms per
+# call, too expensive once Phase 1.4 retry budgets came in).
+DT_CACHE_BASE="$HOME/.amalgame/packages/github.com/amalgame-lang/amalgame-datetime"
+if [ ! -d "$DT_CACHE_BASE" ]; then
+    die "amalgame-datetime not installed in the package cache. Run \`amc package add datetime\` first."
+fi
+DT_VER=$(ls -1 "$DT_CACHE_BASE" 2>/dev/null | sort -V | tail -1)
+[ -n "$DT_VER" ] || die "amalgame-datetime cache empty"
+DT_FACADE="$DT_CACHE_BASE/$DT_VER/facade.am"
+DT_LIB="$DT_CACHE_BASE/$DT_VER/build/linux-x86_64/libamalgame-pkg-DateTime.a"
+[ -f "$DT_FACADE" ] || die "datetime facade.am missing at $DT_FACADE"
+[ -f "$DT_LIB" ]    || die "datetime build archive missing at $DT_LIB — try \`amc package add datetime\` again"
+
+# Compile pollen-node.am with json.am + datetime facade as extra
+# sources so JsonParser / DateTime class methods resolve.
 (cd "$BUILD_DIR" && "$AMC" -o pollen-node \
     "$SRC_DIR/tools/pollen-node.am" \
     "$AMC_STDLIB/json.am" \
+    "$DT_FACADE" \
     --quiet)
 [ -f "$BUILD_DIR/pollen-node.c" ] || die "amc didn't produce pollen-node.c"
 
@@ -112,8 +128,13 @@ for d in "$HOME"/.amalgame/packages/github.com/amalgame-lang/*/; do
     [ -n "$latest" ] && PKG_INCS="$PKG_INCS -I$d$latest/runtime"
 done
 
+# datetime's `@c {}` blocks live in facade.am; amc emits forward
+# decls in the generated .c but not the bodies, so we link against
+# the precompiled libamalgame-pkg-DateTime.a archive that ships in
+# the package cache.
 gcc -O2 -I"$AMC_RUNTIME" $PKG_INCS "$BUILD_DIR/pollen-node.c" \
-    -lgc -lm -lz -ldl -lpthread -o "$BUILD_DIR/pollen-node-bin" \
+    "$DT_LIB" -lgc -lm -lz -ldl -lpthread \
+    -o "$BUILD_DIR/pollen-node-bin" \
     || die "gcc link failed (pollen-node)"
 
 # Compile pollen-client (one-shot UDP send, drops nc -u dep).
@@ -121,11 +142,13 @@ say "Compiling pollen-client…"
 (cd "$BUILD_DIR" && "$AMC" -o pollen-client \
     "$SRC_DIR/tools/pollen-client.am" \
     "$AMC_STDLIB/json.am" \
+    "$DT_FACADE" \
     --quiet)
 [ -f "$BUILD_DIR/pollen-client.c" ] || die "amc didn't produce pollen-client.c"
 
 gcc -O2 -I"$AMC_RUNTIME" $PKG_INCS "$BUILD_DIR/pollen-client.c" \
-    -lgc -lm -lz -ldl -lpthread -o "$BUILD_DIR/pollen-client-bin" \
+    "$DT_LIB" -lgc -lm -lz -ldl -lpthread \
+    -o "$BUILD_DIR/pollen-client-bin" \
     || die "gcc link failed (pollen-client)"
 
 # ── Install ────────────────────────────────────────

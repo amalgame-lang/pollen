@@ -69,7 +69,13 @@ cmd_run() {
                 amc_runtime="$amc_dir/runtime"
                 amc_stdlib="$amc_dir/src/stdlib"
             fi
-            (cd "$tmpdir" && amc -o pollen-node "$SCRIPT_DIR/pollen-node.am" "$amc_stdlib/json.am" --quiet) \
+            local dt_base="$HOME/.amalgame/packages/github.com/amalgame-lang/amalgame-datetime"
+            [ -d "$dt_base" ] || { echo "pollen: amalgame-datetime missing — run 'amc package add datetime'" >&2; exit 2; }
+            local dt_ver dt_facade dt_lib
+            dt_ver=$(ls -1 "$dt_base" 2>/dev/null | sort -V | tail -1)
+            dt_facade="$dt_base/$dt_ver/facade.am"
+            dt_lib="$dt_base/$dt_ver/build/linux-x86_64/libamalgame-pkg-DateTime.a"
+            (cd "$tmpdir" && amc -o pollen-node "$SCRIPT_DIR/pollen-node.am" "$amc_stdlib/json.am" "$dt_facade" --quiet) \
                 || { echo "pollen: amc compile failed" >&2; exit 2; }
             local pkg_incs=""
             for d in "$HOME"/.amalgame/packages/github.com/amalgame-lang/*/; do
@@ -78,7 +84,7 @@ cmd_run() {
                 latest=$(ls -1 "$d" 2>/dev/null | sort -V | tail -1)
                 [ -n "$latest" ] && pkg_incs="$pkg_incs -I$d$latest/runtime"
             done
-            gcc -O2 -I"$amc_runtime" $pkg_incs "$tmpdir/pollen-node.c" \
+            gcc -O2 -I"$amc_runtime" $pkg_incs "$tmpdir/pollen-node.c" "$dt_lib" \
                 -lgc -lm -lz -ldl -lpthread -o "$tmpdir/pollen-node-bin" \
                 || { echo "pollen: gcc link failed" >&2; exit 2; }
             bin="$tmpdir/pollen-node-bin"
@@ -122,7 +128,13 @@ EOF
             amc_runtime="$amc_dir/runtime"
             amc_stdlib="$amc_dir/src/stdlib"
         fi
-        (cd "$tmpdir" && amc -o pollen-client "$SCRIPT_DIR/pollen-client.am" "$amc_stdlib/json.am" --quiet) \
+        local dt_base="$HOME/.amalgame/packages/github.com/amalgame-lang/amalgame-datetime"
+        [ -d "$dt_base" ] || { echo "pollen: amalgame-datetime missing — run 'amc package add datetime'" >&2; exit 2; }
+        local dt_ver dt_facade dt_lib
+        dt_ver=$(ls -1 "$dt_base" 2>/dev/null | sort -V | tail -1)
+        dt_facade="$dt_base/$dt_ver/facade.am"
+        dt_lib="$dt_base/$dt_ver/build/linux-x86_64/libamalgame-pkg-DateTime.a"
+        (cd "$tmpdir" && amc -o pollen-client "$SCRIPT_DIR/pollen-client.am" "$amc_stdlib/json.am" "$dt_facade" --quiet) \
             || { echo "pollen: amc compile failed" >&2; exit 2; }
         local pkg_incs=""
         for d in "$HOME"/.amalgame/packages/github.com/amalgame-lang/*/; do
@@ -131,7 +143,7 @@ EOF
             latest=$(ls -1 "$d" 2>/dev/null | sort -V | tail -1)
             [ -n "$latest" ] && pkg_incs="$pkg_incs -I$d$latest/runtime"
         done
-        gcc -O2 -I"$amc_runtime" $pkg_incs "$tmpdir/pollen-client.c" \
+        gcc -O2 -I"$amc_runtime" $pkg_incs "$tmpdir/pollen-client.c" "$dt_lib" \
             -lgc -lm -lz -ldl -lpthread -o "$tmpdir/pollen-client-bin" \
             || { echo "pollen: gcc link failed" >&2; exit 2; }
         client="$tmpdir/pollen-client-bin"
