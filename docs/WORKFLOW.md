@@ -103,10 +103,10 @@ filtering or auto-route on emit).
 | Phase | Scope |
 |---|---|
 | **3.0** ✅ | Parse workflow.json, self-identify, log role. No runtime dispatch — every MESSAGE still ACKed via the Phase 2.4 hot path. |
-| 3.1 | Consume filtering: drop MESSAGEs whose `topic.uuid` ∉ `consumes`. |
-| 3.2 | Auto-emit on receive: after ACKing a MESSAGE on a consumed topic, publish to every node in `next` using the local handler's output. |
-| 3.3 | Hot-reload via `amalgame-io-filewatcher`. Re-read workflow.json when its mtime changes; re-resolve role, log diff. |
-| 3.4 | Conditional execution via parent UUID chaining (user notes in `project_pollen_roadmap.md`): each sub-execution gets a fresh messageId + the parent's id stored in `parentMessageId`. Orchestrator at the sub-exec's end consults the parent record to decide continue / loop / branch. |
+| **3.1** ✅ | Consume filtering: drop MESSAGEs whose `topic.uuid` ∉ `consumes`. |
+| **3.2** ✅ | Auto-emit on receive: after ACKing a MESSAGE on a consumed topic, publish to every node in `next` using the local handler's output. |
+| **3.3** ✅ | Hot-reload via mtime polling watcher thread. Re-read workflow.json when its mtime changes; atomic swap under mutex. |
+| **3.4** ✅ | parentMessageId chaining: forwarded envelopes get a fresh messageId, and `,"parentMessageId":"<previous>"` is appended so any downstream node can walk back to the producer. Hot-path log distinguishes `(root)` (no parent) from `parent=<uuid>` (descendant). |
 | 3.5 | sharedDir/executions/ persistent state for the DAG (subscriptions and topic registry already shipped in Phase 1.5). |
 | 4 | Mosaic web-based workflow designer (WYSIWYG drag-and-drop, per
 the user notes). Edits workflow.json, broadcasts a SYNC packet
@@ -157,6 +157,16 @@ pollen-node-tcp 7902 --workflow /tmp/pollen-wf.json --node-name xformer  &
 pollen-node-tcp 7903 --workflow /tmp/pollen-wf.json --node-name sink     &
 ```
 
-Each node logs its self-resolved role on startup. Phase 3.2 will
-make this an actual end-to-end pipeline; today they all listen
-and ACK every MESSAGE without filtering.
+Each node logs its self-resolved role on startup. With Phase 3.1
++ 3.2 wired, sending `--publish 127.0.0.1:7902:x.raw:1:hello`
+from a fourth ephemeral node walks the chain:
+
+```
+xformer: workflow: consumed topic=x.raw msg=<A> (root)
+         → forward to 1 next-node(s) (emit topic=x.cooked)
+sink:    workflow: consumed topic=x.cooked msg=<B> parent=<A>
+         → terminal (sink)
+```
+
+(`<A>` is the producer's messageId; `<B>` is the fresh UUID the
+xformer minted when forwarding — Phase 3.4 chain visualization.)
