@@ -1,6 +1,27 @@
 # Pollen workflow.json — schema & semantics
 
-> Phase 3.0 scaffolding (v0.2.0-dev, 2026-05-25)
+> **Document scope:** Pollen workflow.json **v1** — what ships
+> today (Phase 3.0–3.5, v0.2.0-dev, 2026-05-25). The schema is
+> a flat DAG with `next: [...]`. No conditional, no loop.
+>
+> **Future evolutions are spec'd in separate proposals:**
+> - [`workflow-tree.md`](proposals/workflow-tree.md) — Phase 5 :
+>   replaces `next: [...]` with an **execution tree** carrying
+>   `if` / `while` / `for` / `set` / `sequence` / `fan_out` /
+>   `call` nodes. Conditions in JSON-structured form ;
+>   variables routed across `msg.data.X` (volatile) and
+>   `state.X` (persisted in `sharedDir/state/`). Decentralised
+>   evaluation — every Pollen node embarks the tree + an
+>   evaluator. **Proposal — non-implémenté.**
+> - [`capability-lb-ha.md`](proposals/capability-lb-ha.md) —
+>   Phase 6 : workflow.json refers to **actions** (abstract) ;
+>   each instance writes its `capabilities/<id>.json` under
+>   the shared dir, advertising which actions it implements +
+>   its current load. Each instance maintains a local
+>   `action → [providers, …]` registry refreshed every 2 s and
+>   resolves each hop via **power-of-two-choices** LB.
+>   Heartbeat staleness + TCP failover for HA. **Proposal —
+>   non-implémenté ; layer orthogonal à la Phase 5.**
 
 A Pollen network reads its topology from a single JSON file
 hosted on a shared network mount (NFS, SMB, or just a checked-in
@@ -11,7 +32,23 @@ which it emits to whom.
 
 There is **no central scheduler**. The workflow is choreography
 (every node knows its part), not orchestration (a master telling
-nodes what to do).
+nodes what to do). Phase 5/6 keep this property: even with `if` /
+`while` / LB, the runtime stays decentralised — each node decides
+its next hop on its own.
+
+## Tooling
+
+- **Editing :** Pollen Manager (Mosaic web app,
+  [amalgame-lang/pollen-manager](https://github.com/amalgame-lang/pollen-manager),
+  local au commit `cbf23c9` au 2026-05-25). Read/edit du fichier
+  workflow.json depuis le navigateur, SVG render du DAG, dashboard
+  live des executions/ (à venir Phase 4.2).
+- **Hot-reload :** chaque node Pollen poll `mtime(workflow.json)`
+  toutes les 2 s. Une edition (à la main ou via Pollen Manager)
+  est prise en compte sans restart.
+- **Persistance :** chaque node Pollen lancé avec `--shared-dir`
+  écrit un record JSON par hop sous `<dir>/executions/<mid>-<role>.json`
+  (Phase 3.5).
 
 ## Minimum viable schema
 
@@ -98,7 +135,9 @@ If no match is found, the node logs `workflow: no role for
 ACKs every MESSAGE it receives, but doesn't enforce consume
 filtering or auto-route on emit).
 
-## Phase 3.x roadmap
+## Roadmap
+
+### Phase 3 — DAG plat (shipped)
 
 | Phase | Scope |
 |---|---|
@@ -108,7 +147,44 @@ filtering or auto-route on emit).
 | **3.3** ✅ | Hot-reload via mtime polling watcher thread. Re-read workflow.json when its mtime changes; atomic swap under mutex. |
 | **3.4** ✅ | parentMessageId chaining: forwarded envelopes get a fresh messageId, and `,"parentMessageId":"<previous>"` is appended so any downstream node can walk back to the producer. Hot-path log distinguishes `(root)` (no parent) from `parent=<uuid>` (descendant). |
 | **3.5** ✅ | sharedDir/executions/ persistent state. Pass `--shared-dir <path>`; each node writes one record per MESSAGE it touches under `<path>/executions/<mid>-<role>.json`. Same-mid records from emitter + consumer coexist (different `role`); chain walk reads `parentMessageId` and re-globs. |
-| 4 | **Pollen Manager** — separate repo `amalgame-lang/pollen-manager`, Mosaic web app. WYSIWYG drag-and-drop designer for workflow.json, plus a live dashboard reading `sharedDir/executions/`. Edits broadcast SYNC packets to listed nodes to trigger their reload. |
+
+### Phase 4 — Pollen Manager (Mosaic web app, in progress)
+
+Repo séparé : `amalgame-lang/pollen-manager`. Scaffold local au
+commit `cbf23c9`. Workflow.json reste v1 dans cette phase ; le
+manager édite/visualise du JSON v1 plat.
+
+| Phase | Scope |
+|---|---|
+| **4.0** ✅ scaffold | GET `/api/workflow` + SVG read-only render + textarea editor + Copy-to-clipboard (PUT à venir 4.0.5) |
+| 4.0.5 | PUT `/api/workflow` (bloqué : amalgame-web v0.13.3 WebContext ne expose pas `Request.Body` — fix upstream requis) |
+| 4.1 | WYSIWYG drag-and-drop des nodes sur le SVG + édition panel-side de consumes/emits/next. Positions persistées dans `_layout` sidecar de workflow.json (ignoré par Pollen). |
+| 4.2 | Live executions dashboard : poll `/api/executions`, overlay des status sur le DAG |
+| 4.3 | SYNC broadcast à chaque save (au lieu du watcher 2 s) |
+| 4.4 | Intervention manuelle (force-ACK, replay, cancel) — besoin endpoint côté pollen-node-tcp |
+
+### Phase 5 — Execution tree (proposal, non implémenté)
+
+[`docs/proposals/workflow-tree.md`](proposals/workflow-tree.md)
+
+Le `next: [...]` v1 disparaît. Le workflow gagne un `tree:`
+contenant `if` / `while` / `for` / `set` / `sequence` / `fan_out` /
+`call` / `end`. Schema v2 : nodes deviennent un array indexé par
+UUID + section `vars` pour les constantes globales. Évaluation
+décentralisée — chaque node Pollen embarque le tree et un
+évaluateur d'expressions JSON-structurées. État partagé survie-crash
+via `<sharedDir>/state/<root>.json`.
+
+### Phase 6 — Capability discovery + LB + HA (proposal, non implémenté)
+
+[`docs/proposals/capability-lb-ha.md`](proposals/capability-lb-ha.md)
+
+Le workflow référence des **actions** abstraites (`encode-video`)
+au lieu d'instances. Chaque instance Pollen advertise ses
+capabilities + sa charge sous `<sharedDir>/capabilities/<id>.json`
+toutes les 5 s. Routage via power-of-two-choices sur `load.inFlight`.
+HA via heartbeat staleness + TCP failover. Layer orthogonal à
+la Phase 5 — peut être impl indépendamment.
 
 ## Wire envelope (recap)
 
