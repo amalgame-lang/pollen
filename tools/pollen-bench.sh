@@ -46,6 +46,22 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Resource guard: pollen-node since v0.1.0-dev (Phase 1.5c) spawns
+# its own acceptor thread, so K publishers = K × 2 threads + 1
+# receiver. On a small VM (≤4 cores, ≤2 GB RAM), K above 8 can
+# overwhelm the scheduler / OOM-kill the host. Refuse to launch
+# something that's likely to crash the box; users on bare metal
+# can override with -F (force).
+FORCE_BIG=0
+if [ "${1:-}" = "-F" ]; then FORCE_BIG=1; shift; fi
+if [ "$K" -gt 12 ] && [ "$FORCE_BIG" -eq 0 ]; then
+    echo "pollen-bench: K=$K asks for $((K * 2 + 1)) threads + $((K + 1)) processes." >&2
+    echo "              This has crashed small VMs in testing. Either:" >&2
+    echo "              - drop to K=8 or below (sweet spot for current architecture)" >&2
+    echo "              - re-run with -F if you know your host can take it" >&2
+    exit 2
+fi
+
 # ── locate pollen-node binary ────────────────────────
 if [ -z "$NODE_BIN" ]; then
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
