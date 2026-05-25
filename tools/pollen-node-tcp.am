@@ -167,7 +167,8 @@ import Amalgame.String
             const char* parent_mid, size_t parent_mid_len,
             const char* topic_in, size_t topic_in_len,
             const char* topic_out,
-            int n_nexts) {
+            int n_nexts,
+            const char* dbg_session, size_t dbg_session_len) {
         if (!_pollen_shared_dir[0]) return;
         char path[1024];
         snprintf(path, sizeof(path), "%s/executions/%.*s-%s.json",
@@ -176,8 +177,16 @@ import Amalgame.String
                  _pollen_self_role[0] ? _pollen_self_role : "node");
         int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
         if (fd < 0) return;  /* dup or fs error: best-effort, skip */
-        char buf[1024];
+        char buf[1280];
         int64_t now = _pollen_now_ms_c();
+        /* Phase 4.5.1 — optional debugSession suffix. Only present
+         * when the incoming envelope carried a `debug` field. */
+        char dbg_suffix[80] = "";
+        if (dbg_session && dbg_session_len > 0 && dbg_session_len < 64) {
+            snprintf(dbg_suffix, sizeof(dbg_suffix),
+                ",\"debugSession\":\"%.*s\"",
+                (int) dbg_session_len, dbg_session);
+        }
         int n;
         if (parent_mid && parent_mid_len > 0) {
             n = snprintf(buf, sizeof(buf),
@@ -185,7 +194,7 @@ import Amalgame.String
                 "\"parentMessageId\":\"%.*s\","
                 "\"role\":\"%s\",\"topicIn\":\"%.*s\","
                 "\"topicOut\":\"%s\",\"nextCount\":%d,"
-                "\"node\":\"%s:%d\",\"timestamp\":%lld}\n",
+                "\"node\":\"%s:%d\",\"timestamp\":%lld%s}\n",
                 (int) mid_out_len, mid_out,
                 (int) parent_mid_len, parent_mid,
                 _pollen_self_role,
@@ -193,21 +202,23 @@ import Amalgame.String
                 topic_out ? topic_out : "",
                 n_nexts,
                 _pollen_self_host, _pollen_self_port,
-                (long long) now);
+                (long long) now,
+                dbg_suffix);
         } else {
             n = snprintf(buf, sizeof(buf),
                 "{\"messageId\":\"%.*s\","
                 "\"parentMessageId\":null,"
                 "\"role\":\"%s\",\"topicIn\":\"%.*s\","
                 "\"topicOut\":\"%s\",\"nextCount\":%d,"
-                "\"node\":\"%s:%d\",\"timestamp\":%lld}\n",
+                "\"node\":\"%s:%d\",\"timestamp\":%lld%s}\n",
                 (int) mid_out_len, mid_out,
                 _pollen_self_role,
                 (int) topic_in_len, topic_in,
                 topic_out ? topic_out : "",
                 n_nexts,
                 _pollen_self_host, _pollen_self_port,
-                (long long) now);
+                (long long) now,
+                dbg_suffix);
         }
         if (n > 0 && n < (int) sizeof(buf)) {
             write(fd, buf, (size_t) n);
@@ -722,6 +733,26 @@ import Amalgame.String
                                     parent_len = (size_t)(pq - parent_start);
                                 }
                             }
+                            /* Phase 4.5.1 — surface incoming debug
+                             * session id so each hop's record reveals
+                             * which debug session it belonged to.
+                             * Pure pass-through observation : the
+                             * envelope's full debug field is propagated
+                             * by _pollen_wf_rebuild_envelope as part
+                             * of the data-through-close slice. */
+                            const char* DBG_KEY = "\"debug\":{\"session\":\"";
+                            const char* dp = _pollen_find(rbuf, line_len,
+                                DBG_KEY, 20);
+                            const char* dbg_session = NULL;
+                            size_t dbg_session_len = 0;
+                            if (dp) {
+                                dbg_session = dp + 20;
+                                const char* dq = memchr(dbg_session, '"',
+                                    line_len - (size_t)(dbg_session - rbuf));
+                                if (dq) {
+                                    dbg_session_len = (size_t)(dq - dbg_session);
+                                }
+                            }
                             char fwd_new_mid[37] = {0};
                             if (_pollen_wf_n_nexts > 0) {
                                 _pollen_wf_forward_all(rbuf, line_len,
@@ -758,7 +789,8 @@ import Amalgame.String
                                         topic_start, topic_len,
                                         _pollen_wf_emit_topic[0] ?
                                             _pollen_wf_emit_topic : NULL,
-                                        _pollen_wf_n_nexts);
+                                        _pollen_wf_n_nexts,
+                                        dbg_session, dbg_session_len);
                                 }
                             } else {
                                 if (parent_start) {
@@ -785,7 +817,8 @@ import Amalgame.String
                                     parent_start, parent_len,
                                     topic_start, topic_len,
                                     NULL,
-                                    0);
+                                    0,
+                                    dbg_session, dbg_session_len);
                             }
                             fflush(stdout);
                         }
@@ -842,19 +875,52 @@ public class Program {
         return Json.Encode(v)
     }
 
+    // Phase 4.5.1 — build the `debug` field JSON that gets
+    // attached to publisher envelopes when --debug is set.
+    // Shape :  {"session":"<sid>","mode":"step|breakpoint",
+    //           "manager":"host:port","breakpoints":["role",…],
+    //           "hit_bp":false}
+    // `bpCsv` is the raw comma-separated --debug-bp list ; empty
+    // = no breakpoints (only meaningful for mode="breakpoint").
+    public static string BuildDebugJson(string mode, string session,
+                                         string manager, string bpCsv) {
+        var bps: string = "[]"
+        if (String_Length(bpCsv) > 0) {
+            let parts: List<string> = String_Split(bpCsv, ",")
+            var inner: string = ""
+            let n: int = parts.Count()
+            for i in 0..n {
+                let p: string = parts.Get(i)
+                if (String_Length(p) == 0) { continue }
+                if (String_Length(inner) > 0) { inner = inner + "," }
+                inner = inner + "{\"role\":\"" + Json.EscapeString(p) + "\"}"
+            }
+            bps = "[" + inner + "]"
+        }
+        return "{\"session\":\"" + Json.EscapeString(session) + "\"," +
+               "\"mode\":\"" + Json.EscapeString(mode) + "\"," +
+               "\"manager\":\"" + Json.EscapeString(manager) + "\"," +
+               "\"breakpoints\":" + bps + "," +
+               "\"hit_bp\":false}"
+    }
+
     public static string EncodeMessage(string topicUuid, int topicVersion,
                                        string dataJson, string messageId,
-                                       int timestamp) {
+                                       int timestamp, string debugJson) {
         let mid: string = Json.EscapeString(messageId)
         let tu:  string = Json.EscapeString(topicUuid)
         let tv:  string = String_FromInt(topicVersion)
         let ts:  string = String_FromInt(timestamp)
+        var dbg: string = ""
+        if (String_Length(debugJson) > 0) {
+            dbg = ",\"debug\":" + debugJson
+        }
         return "{\"messageId\":\"" + mid +
                "\",\"type\":\"MESSAGE\"," +
                "\"topic\":{\"uuid\":\"" + tu +
                "\",\"version\":" + tv + "}," +
                "\"data\":" + dataJson + "," +
-               "\"timestamp\":" + ts + "}"
+               "\"timestamp\":" + ts + dbg + "}"
     }
 
     // ── Phase 3.3: workflow.json loader (factored out of Main) ──
@@ -1008,7 +1074,8 @@ public class Program {
 
     public static int PublishStream(string peerIp, int peerPort,
                                      string topicUuid, int topicVersion,
-                                     string dataJson, int count) {
+                                     string dataJson, int count,
+                                     string debugJson) {
         let cli = TcpClient_Connect(peerIp, peerPort)
         if (!cli.Connected) {
             Console.WriteLine("publish-stream FAILED to {peerIp}:{peerPort} (connect refused)")
@@ -1022,7 +1089,7 @@ public class Program {
             let mid:  string = Program.UuidV4()
             let now:  int    = Program.NowMs()
             let body: string = Program.EncodeMessage(topicUuid, topicVersion,
-                                                      dataJson, mid, now)
+                                                      dataJson, mid, now, debugJson)
             // amc resolver bug: TcpClient_Send declared void but C
             // returns code_bool — can't capture. Rely on the recv
             // path to surface broken sockets.
@@ -1093,6 +1160,19 @@ public class Program {
         // records. When set, each MESSAGE traversal at this node
         // writes <path>/executions/<mid>.json.
         var sharedDir:    string = ""
+        // Phase 4.5.1 debug stepper — when --debug is "step" or
+        // "breakpoint", outbound MESSAGES via --publish or --burst
+        // get a `debug` field in the envelope :
+        //   {"session":"<uuid>","mode":"step|breakpoint",
+        //    "manager":"<host:port>","breakpoints":["role",…],
+        //    "hit_bp":false}
+        // The hot path on receiving nodes ignores it in 4.5.1 — only
+        // _pollen_wf_rebuild_envelope propagates the field hop-to-hop
+        // (preserved verbatim). Pause behaviour lands in 4.5.2.
+        var debugMode:    string = ""
+        var debugSession: string = ""
+        var debugManager: string = ""
+        var debugBps:     string = ""
 
         var i: int = 1
         while (i < Args_Count()) {
@@ -1144,6 +1224,42 @@ public class Program {
                     continue
                 }
                 Console.WriteLine("pollen-node-tcp: --shared-dir needs a directory path")
+                return
+            }
+            if (a == "--debug") {
+                if (i + 1 < Args_Count()) {
+                    debugMode = Args_Get(i + 1)
+                    i = i + 2
+                    continue
+                }
+                Console.WriteLine("pollen-node-tcp: --debug needs step|breakpoint")
+                return
+            }
+            if (a == "--debug-session") {
+                if (i + 1 < Args_Count()) {
+                    debugSession = Args_Get(i + 1)
+                    i = i + 2
+                    continue
+                }
+                Console.WriteLine("pollen-node-tcp: --debug-session needs a uuid")
+                return
+            }
+            if (a == "--debug-manager") {
+                if (i + 1 < Args_Count()) {
+                    debugManager = Args_Get(i + 1)
+                    i = i + 2
+                    continue
+                }
+                Console.WriteLine("pollen-node-tcp: --debug-manager needs a host:port")
+                return
+            }
+            if (a == "--debug-bp") {
+                if (i + 1 < Args_Count()) {
+                    debugBps = Args_Get(i + 1)
+                    i = i + 2
+                    continue
+                }
+                Console.WriteLine("pollen-node-tcp: --debug-bp needs a comma-separated role list")
                 return
             }
             if (port == 5000) {
@@ -1365,6 +1481,24 @@ public class Program {
             }
         }
 
+        // Phase 4.5.1 — validate + default the debug flags.
+        // --debug requires a session (auto-generated if empty) and
+        // a manager address (no default, must be supplied).
+        if (String_Length(debugMode) > 0) {
+            if (debugMode != "step" && debugMode != "breakpoint") {
+                Console.WriteLine("pollen-node-tcp: --debug must be 'step' or 'breakpoint' (got '{debugMode}')")
+                return
+            }
+            if (String_Length(debugSession) == 0) {
+                debugSession = Program.UuidV4()
+                Console.WriteLine("pollen-node-tcp: --debug-session auto-generated = {debugSession}")
+            }
+            if (String_Length(debugManager) == 0) {
+                Console.WriteLine("pollen-node-tcp: --debug requires --debug-manager <host:port>")
+                return
+            }
+        }
+
         // Startup-time publishes. All specs that target the same
         // ip:port stream over a single TCP connection — TCP handshake
         // is paid once per peer, not once per MESSAGE.
@@ -1454,16 +1588,30 @@ public class Program {
                     let firstIdx: int = group.Get(0)
                     let gTopic: string = uuids.Get(firstIdx)
                     let gVer:   int    = vers.Get(firstIdx)
-                    // Pass first data verbatim. Per-iter variance
-                    // costs an AM substring-search at startup that
-                    // ate the C hot-path gain — drop it. Every
-                    // msg in this group has the same data; only
-                    // messageId varies. Bench dedups on messageId,
-                    // not data, so this stays correct.
                     let firstData: string = datas.Get(firstIdx)
-                    @c {
-                        pollen_hot_publish_stream(
-                            pIp, pPort, gTopic, gVer, firstData, gn);
+                    // Phase 4.5.1 — when --debug is set the publish
+                    // envelope needs a `debug` JSON object, which
+                    // the C hot-path snprintf doesn't know how to
+                    // build. Dispatch to the AM PublishStream
+                    // (slower, ~10× the cost) only in that case.
+                    // Debug sessions are by definition human-paced
+                    // → the perf delta is irrelevant.
+                    if (String_Length(debugMode) > 0) {
+                        let dj: string = Program.BuildDebugJson(
+                            debugMode, debugSession, debugManager, debugBps)
+                        Program.PublishStream(pIp, pPort, gTopic, gVer,
+                                              firstData, gn, dj)
+                    } else {
+                        // Pass first data verbatim. Per-iter variance
+                        // costs an AM substring-search at startup that
+                        // ate the C hot-path gain — drop it. Every
+                        // msg in this group has the same data; only
+                        // messageId varies. Bench dedups on messageId,
+                        // not data, so this stays correct.
+                        @c {
+                            pollen_hot_publish_stream(
+                                pIp, pPort, gTopic, gVer, firstData, gn);
+                        }
                     }
                 }
                 // Advance i past all entries in this group
