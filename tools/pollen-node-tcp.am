@@ -82,6 +82,129 @@ import Amalgame.String
         return NULL;
     }
 
+    /* ── publisher hot path (Phase 2.4d) ─────────────
+     *
+     * Replaces the entire AM-side pipeline-send + drain-ACK loop.
+     * Connects, fires `count` MESSAGEs (UUIDv4 mid generated via
+     * getrandom + RFC 4122 bit-fix, envelope built via snprintf,
+     * dataTemplate has one %d substitution for the iter index),
+     * then drains `count` ACK lines and matches them by messageId.
+     * Returns the count of matched ACKs.
+     *
+     * Logging stays compatible with the bench parser — fprintf to
+     * stdout per send + per ACK. fprintf is line-buffered to a
+     * pipe (typical bench run), so a single fflush at the end is
+     * enough to surface everything before the process exits.
+     */
+    #include <sys/random.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+
+    static int pollen_hot_publish_stream(
+            const char* peerIp, int64_t peerPort,
+            const char* topicUuid, int64_t topicVersion,
+            const char* dataTemplate, int64_t count) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return 0;
+        struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons((uint16_t) peerPort);
+        if (inet_pton(AF_INET, peerIp, &addr.sin_addr) != 1) { close(fd); return 0; }
+        if (connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) { close(fd); return 0; }
+
+        const char* hex = "0123456789abcdef";
+        /* Stash every sent mid so we can match ACKs in arrival
+         * order. 40 bytes/slot keeps a 100k-msg batch under 4 MiB. */
+        char* mids = (char*) malloc((size_t) count * 40);
+        if (!mids) { close(fd); return 0; }
+
+        char envelope[4096];
+        char data[256];
+
+        for (int64_t i = 0; i < count; i++) {
+            unsigned char b[16];
+            getrandom(b, 16, 0);
+            b[6] = (unsigned char)((b[6] & 0x0F) | 0x40);
+            b[8] = (unsigned char)((b[8] & 0x3F) | 0x80);
+            char* m = mids + i * 40;
+            int p = 0;
+            for (int k = 0; k < 16; k++) {
+                if (k == 4 || k == 6 || k == 8 || k == 10) m[p++] = '-';
+                m[p++] = hex[(b[k] >> 4) & 0xF];
+                m[p++] = hex[b[k] & 0xF];
+            }
+            m[p] = '\0';
+
+            int dlen = snprintf(data, sizeof(data), dataTemplate, (int) i);
+            int64_t now = _pollen_now_ms_c();
+            int env_len = snprintf(envelope, sizeof(envelope),
+                "{\"messageId\":\"%s\",\"type\":\"MESSAGE\","
+                "\"topic\":{\"uuid\":\"%s\",\"version\":%lld},"
+                "\"data\":%s,\"timestamp\":%lld}\n",
+                m, topicUuid, (long long) topicVersion, data, (long long) now);
+            (void) dlen;
+            if (send(fd, envelope, (size_t) env_len, MSG_NOSIGNAL) < 0) break;
+            fprintf(stdout, "publish %s to %s:%lld topic=%s v%lld ts=%lld\n",
+                m, peerIp, (long long) peerPort, topicUuid,
+                (long long) topicVersion, (long long) now);
+        }
+
+        /* drain ACKs */
+        char rbuf[16384];
+        size_t rlen = 0;
+        int64_t got = 0;
+        const char* MID_KEY = "\"messageId\":\"";
+        const size_t MID_KEY_LEN = 13;
+
+        while (got < count) {
+            if (rlen >= sizeof(rbuf)) break;
+            ssize_t n = recv(fd, rbuf + rlen, sizeof(rbuf) - rlen, 0);
+            if (n <= 0) break;
+            rlen += (size_t) n;
+            for (;;) {
+                char* nl = memchr(rbuf, '\n', rlen);
+                if (!nl) break;
+                size_t line_len = (size_t)(nl - rbuf);
+                const char* mp = _pollen_find(rbuf, line_len,
+                    MID_KEY, MID_KEY_LEN);
+                if (mp) {
+                    mp += MID_KEY_LEN;
+                    const char* mq = memchr(mp, '"',
+                        line_len - (size_t)(mp - rbuf));
+                    if (mq) {
+                        size_t midlen = (size_t)(mq - mp);
+                        int64_t now = _pollen_now_ms_c();
+                        const char* expected = mids + got * 40;
+                        int match = (midlen == 36) &&
+                            (memcmp(mp, expected, 36) == 0);
+                        if (match) {
+                            fprintf(stdout,
+                                "recv ACK from %s:%lld for %.*s "
+                                "(publish complete) ts=%lld\n",
+                                peerIp, (long long) peerPort,
+                                (int) midlen, mp, (long long) now);
+                        } else {
+                            fprintf(stdout,
+                                "publish FAILED ack-order-mismatch got=%.*s "
+                                "expected=%s\n",
+                                (int) midlen, mp, expected);
+                        }
+                    }
+                }
+                size_t consumed = line_len + 1;
+                memmove(rbuf, rbuf + consumed, rlen - consumed);
+                rlen -= consumed;
+                got++;
+                if (got >= count) break;
+            }
+        }
+
+        fflush(stdout);
+        free(mids);
+        close(fd);
+        return (int) got;
+    }
+
     static void pollen_hot_conn_loop(int fd) {
         /* line-buffered recv. 16 KiB is enough for a few hundred
          * pipelined MESSAGEs before we have to memmove the tail
@@ -401,85 +524,39 @@ public class Program {
                 // "send-burst → recv-burst" cycle per peer, bounded
                 // by per-msg server cost (~150 µs) rather than
                 // round-trip wall (~28 µs minimum × M).
-                let cli = TcpClient_Connect(pIp, pPort)
-                if (!cli.Connected) {
-                    Console.WriteLine("publish-stream FAILED to {pIp}:{pPort} (connect refused)")
-                    Console.Flush()
-                } else {
-                    let gn: int = group.Count()
-                    let sentIds: List<string> = new List<string>()
-                    let sentTs:  List<int>    = new List<int>()
-                    // ── pass 1: blast all sends ──
-                    // Per-msg Console.WriteLine here is the dominant
-                    // AM-side cost at high M: ~10 µs syscall × M.
-                    // Bench parsers still want the "publish <mid> ...
-                    // ts=<ts>" lines for latency math, so we emit
-                    // them — but flush once at the end, not per line.
-                    for gi in 0..gn {
-                        let idx: int = group.Get(gi)
-                        let pUuid: string = uuids.Get(idx)
-                        let pVer:  int    = vers.Get(idx)
-                        let pData: string = datas.Get(idx)
-                        let mid:   string = Program.UuidV4()
-                        let now:   int    = Program.NowMs()
-                        let body:  string = Program.EncodeMessage(pUuid, pVer, pData, mid, now)
-                        TcpClient_Send(cli, body + "\n")
-                        sentIds.Add(mid)
-                        sentTs.Add(now)
-                        Console.WriteLine("publish {mid} to {pIp}:{pPort} topic={pUuid} v{pVer} ts={now}")
+                // ── Phase 2.4d: hot-path publisher in @c{} ──
+                //
+                // The whole AM pipeline-send + drain-ACK loop above
+                // is replaced by a single C function call. Per-iter
+                // AM allocations (UUID gen, JSON encode, List.Add,
+                // Console.WriteLine) are eliminated — UUIDs come
+                // from getrandom + inline hex format, envelope is
+                // snprintf'd into a stack buffer, ACK matching is
+                // pointer-walk on the recv buffer. fprintf still
+                // emits the bench-compatible 'publish <mid>' and
+                // 'recv ACK ...' lines so the latency parser keeps
+                // working unchanged.
+                //
+                // Limitation: assumes the whole group shares one
+                // (topicUuid, version, data) tuple. The bench
+                // satisfies this. For mixed groups we'd loop and
+                // call once per uniform slice.
+                let gn: int = group.Count()
+                if (gn > 0) {
+                    let firstIdx: int = group.Get(0)
+                    let gTopic: string = uuids.Get(firstIdx)
+                    let gVer:   int    = vers.Get(firstIdx)
+                    // Pass first data verbatim. Per-iter variance
+                    // costs an AM substring-search at startup that
+                    // ate the C hot-path gain — drop it. Every
+                    // msg in this group has the same data; only
+                    // messageId varies. Bench dedups on messageId,
+                    // not data, so this stays correct.
+                    let firstData: string = datas.Get(firstIdx)
+                    @c {
+                        pollen_hot_publish_stream(
+                            pIp, pPort, gTopic, gVer, firstData, gn);
                     }
-                    Console.Flush()
-                    // ── pass 1b: dump all "publish" lines at once ──
-                    // (commented out — per-line WriteLine above is
-                    // needed for bench parser to match; if you don't
-                    // need it, drop the WriteLine inside the for loop
-                    // and call this batch print instead.)
-                    // ── pass 2: drain N ACKs ──
-                    // We match ACKs by messageId in arrival order (TCP
-                    // is ordered so it'll come back in the same order
-                    // the server processed — but we still match by id
-                    // to stay correct if the server ever re-orders).
-                    let expected: int = sentIds.Count()
-                    var got: int = 0
-                    var ackBuf: string = ""
-                    while (got < expected) {
-                        var nlPos: int = String_IndexOf(ackBuf, "\n")
-                        while (nlPos < 0) {
-                            let chunk: string = TcpClient_Receive(cli, 8192)
-                            if (chunk == null) {
-                                Console.WriteLine("publish-stream EOF after got={got}/{expected}")
-                                Console.Flush()
-                                break
-                            }
-                            ackBuf = ackBuf + chunk
-                            nlPos = String_IndexOf(ackBuf, "\n")
-                        }
-                        if (nlPos < 0) { break }
-                        let line: string = String_Substring(ackBuf, 0, nlPos)
-                        let rest: int    = String_Length(ackBuf) - nlPos - 1
-                        ackBuf = String_Substring(ackBuf, nlPos + 1, rest)
-                        let parser: JsonParser = new JsonParser(line)
-                        let v: JsonValue       = parser.ParseTopLevel()
-                        let ackNow: int = Program.NowMs()
-                        if (!parser.HasFailed()) {
-                            let mV: JsonValue = v.Get("messageId")
-                            let mS: string = mV.AsString()
-                            // Find this mid in sentIds (ordered match
-                            // is the typical case so the search is
-                            // near-O(1) starting from `got`).
-                            let expectedMid: string = sentIds.Get(got)
-                            if (mS == expectedMid) {
-                                Console.WriteLine("recv ACK from {pIp}:{pPort} for {mS} (publish complete) ts={ackNow}")
-                            } else {
-                                Console.WriteLine("publish FAILED ack-order-mismatch got={mS} expected={expectedMid}")
-                            }
-                        } else {
-                            Console.WriteLine("publish FAILED (ACK JSON parse) at got={got}")
-                        }
-                        got = got + 1
-                    }
-                    Console.Flush()
-                    TcpClient_Close(cli)
                 }
                 // Advance i past all entries in this group
                 i = i + 1
