@@ -61,6 +61,7 @@ import Amalgame.String
     #include <stdio.h>
     #include <stdint.h>
     #include <time.h>
+    #include <sys/random.h>
 
     /* Forward decl: needed by _pollen_wf_rewrite_topic below which
      * comes before the actual definition further down. */
@@ -208,6 +209,119 @@ import Amalgame.String
         close(fd);
     }
 
+    /* Phase 3.4 — generate a fresh UUIDv4 RFC 4122 into buf[37].
+     * Caller guarantees buf is ≥ 37 bytes. */
+    static void _pollen_gen_uuid(char* buf) {
+        unsigned char b[16];
+        getrandom(b, 16, 0);
+        b[6] = (unsigned char)((b[6] & 0x0F) | 0x40);
+        b[8] = (unsigned char)((b[8] & 0x3F) | 0x80);
+        const char* hex = "0123456789abcdef";
+        int p = 0;
+        for (int k = 0; k < 16; k++) {
+            if (k == 4 || k == 6 || k == 8 || k == 10) buf[p++] = '-';
+            buf[p++] = hex[(b[k] >> 4) & 0xF];
+            buf[p++] = hex[b[k] & 0xF];
+        }
+        buf[p] = '\0';
+    }
+
+    /* Phase 3.4 — rebuild an envelope for forward: fresh messageId,
+     * topic optionally rewritten, parentMessageId appended carrying
+     * the OLD messageId (so downstream nodes can walk the chain
+     * back to the producer). Returns the length of the rebuilt
+     * buffer (including trailing '\n'), or 0 on parse failure
+     * (caller falls back to verbatim forward).
+     *
+     * Memory layout of the output:
+     *
+     *   in[0 .. msgid_value_pos)    "messageId":"
+     *   <NEW 36-char UUID>          (always replaces old)
+     *   in[msgid_end_pos .. topic_uuid_value_pos)
+     *                               …rest until topic.uuid value if rewriting…
+     *   <NEW topic>                 (only if new_topic != NULL)
+     *   in[topic_uuid_end_pos .. close_pos)
+     *                               …rest of the envelope up to the closing '}'…
+     *   ,"parentMessageId":"        chain field
+     *   <OLD 36-char UUID>
+     *   "}                          terminator
+     *   \n
+     */
+    static size_t _pollen_wf_rebuild_envelope(
+            const char* in, size_t in_len,
+            char* out, size_t out_cap,
+            const char* new_topic) {
+        const char* m_key = _pollen_find(in, in_len, "\"messageId\":\"", 13);
+        if (!m_key) return 0;
+        const char* old_mid = m_key + 13;
+        const char* old_mid_end = memchr(old_mid, '"',
+            in_len - (size_t)(old_mid - in));
+        if (!old_mid_end || (size_t)(old_mid_end - old_mid) != 36) return 0;
+
+        const char* t_uuid_start = NULL;
+        const char* t_uuid_end = NULL;
+        if (new_topic) {
+            const char* t_key = _pollen_find(in, in_len,
+                "\"topic\":{\"uuid\":\"", 17);
+            if (t_key) {
+                t_uuid_start = t_key + 17;
+                t_uuid_end = memchr(t_uuid_start, '"',
+                    in_len - (size_t)(t_uuid_start - in));
+                if (!t_uuid_end) { t_uuid_start = NULL; }
+            }
+        }
+
+        /* find the closing '}' before any trailing whitespace */
+        size_t e = in_len;
+        while (e > 0 && (in[e-1] == '\n' || in[e-1] == '\r' ||
+                          in[e-1] == ' '  || in[e-1] == '\t')) e--;
+        if (e == 0 || in[e-1] != '}') return 0;
+        size_t close_pos = e - 1;
+
+        char new_mid[37];
+        _pollen_gen_uuid(new_mid);
+
+        /* Emit piecewise into out[] with bounds checks. */
+        size_t o = 0;
+        #define _PE(src, n) do { \
+            if (o + (n) > out_cap) return 0; \
+            memcpy(out + o, (src), (n)); o += (n); \
+        } while (0)
+
+        size_t mid_value_pos = (size_t)(old_mid - in);
+        size_t mid_end_pos   = (size_t)(old_mid_end - in);
+
+        /* Up to "messageId":" */
+        _PE(in, mid_value_pos);
+        /* New 36-char UUID */
+        _PE(new_mid, 36);
+
+        if (t_uuid_start && t_uuid_end && new_topic) {
+            size_t t_v_pos = (size_t)(t_uuid_start - in);
+            size_t t_e_pos = (size_t)(t_uuid_end - in);
+            /* between old messageId close-quote and topic.uuid value */
+            _PE(in + mid_end_pos, t_v_pos - mid_end_pos);
+            /* new topic */
+            size_t tlen = strlen(new_topic);
+            _PE(new_topic, tlen);
+            /* topic.uuid end through closing '}' */
+            _PE(in + t_e_pos, close_pos - t_e_pos);
+        } else {
+            /* no topic rewrite: old messageId close-quote through '}' */
+            _PE(in + mid_end_pos, close_pos - mid_end_pos);
+        }
+
+        /* ,"parentMessageId":"<OLD>"} \n */
+        const char* PARENT_OPEN = ",\"parentMessageId\":\"";
+        _PE(PARENT_OPEN, 20);
+        _PE(old_mid, 36);
+        _PE("\"}", 2);
+        _PE("\n", 1);
+
+        #undef _PE
+        return o;
+    }
+
     /* Rewrite topic.uuid in-place in a fresh buffer. Returns the
      * length of the rewritten envelope, or 0 if the topic block
      * couldn't be located (caller falls back to verbatim forward).
@@ -237,14 +351,20 @@ import Amalgame.String
     }
 
     static void _pollen_wf_forward_all(const char* envelope, size_t env_len) {
-        char rewritten[4096];
+        /* Phase 3.4: always rebuild with fresh messageId +
+         * parentMessageId chain. Topic is rewritten too if the
+         * node declared an emits[0]. Failure to rebuild (oversize
+         * envelope, parse mismatch) falls back to verbatim — the
+         * forward still goes through, just without the chain. */
+        char rebuilt[8192];
         const char* fwd = envelope;
         size_t fwd_len = env_len;
-        if (_pollen_wf_emit_topic[0] != '\0') {
-            size_t rn = _pollen_wf_rewrite_topic(envelope, env_len,
-                                                  rewritten, sizeof(rewritten));
-            if (rn > 0) { fwd = rewritten; fwd_len = rn; }
-        }
+        const char* new_topic = _pollen_wf_emit_topic[0] ?
+                                _pollen_wf_emit_topic : NULL;
+        size_t rn = _pollen_wf_rebuild_envelope(envelope, env_len,
+                                                 rebuilt, sizeof(rebuilt),
+                                                 new_topic);
+        if (rn > 0) { fwd = rebuilt; fwd_len = rn; }
         for (int i = 0; i < _pollen_wf_n_nexts; i++) {
             _pollen_wf_forward_one(_pollen_wf_next_host[i],
                                    _pollen_wf_next_port[i],
@@ -485,25 +605,65 @@ import Amalgame.String
                          * upstream publish-complete shouldn't wait
                          * on the downstream forward. */
                         if (do_forward) {
+                            /* Phase 3.4: surface incoming
+                             * parentMessageId so the operator can
+                             * trace the chain back to its root.
+                             * Absent on producer-published msgs;
+                             * present on every forwarded msg. */
+                            const char* PAR_KEY = "\"parentMessageId\":\"";
+                            const char* pp = _pollen_find(rbuf, line_len,
+                                PAR_KEY, 19);
+                            const char* parent_start = NULL;
+                            size_t parent_len = 0;
+                            if (pp) {
+                                parent_start = pp + 19;
+                                const char* pq = memchr(parent_start, '"',
+                                    line_len - (size_t)(parent_start - rbuf));
+                                if (pq) {
+                                    parent_len = (size_t)(pq - parent_start);
+                                }
+                            }
                             if (_pollen_wf_n_nexts > 0) {
                                 _pollen_wf_forward_all(rbuf, line_len);
-                                fprintf(stdout,
-                                    "workflow: consumed topic=%.*s "
-                                    "msg=%.*s → forward to %d next-node(s)"
-                                    " (emit topic=%s)\n",
-                                    (int) topic_len, topic_start,
-                                    (int) midlen, mp,
-                                    _pollen_wf_n_nexts,
-                                    _pollen_wf_emit_topic[0] ? _pollen_wf_emit_topic : "(verbatim)");
+                                if (parent_start) {
+                                    fprintf(stdout,
+                                        "workflow: consumed topic=%.*s "
+                                        "msg=%.*s parent=%.*s "
+                                        "→ forward to %d next-node(s) "
+                                        "(emit topic=%s)\n",
+                                        (int) topic_len, topic_start,
+                                        (int) midlen, mp,
+                                        (int) parent_len, parent_start,
+                                        _pollen_wf_n_nexts,
+                                        _pollen_wf_emit_topic[0] ? _pollen_wf_emit_topic : "(verbatim)");
+                                } else {
+                                    fprintf(stdout,
+                                        "workflow: consumed topic=%.*s "
+                                        "msg=%.*s (root) "
+                                        "→ forward to %d next-node(s) "
+                                        "(emit topic=%s)\n",
+                                        (int) topic_len, topic_start,
+                                        (int) midlen, mp,
+                                        _pollen_wf_n_nexts,
+                                        _pollen_wf_emit_topic[0] ? _pollen_wf_emit_topic : "(verbatim)");
+                                }
                             } else {
-                                /* terminal sink: consumed but no
-                                 * next list — log so the operator
-                                 * sees the message landed here. */
-                                fprintf(stdout,
-                                    "workflow: consumed topic=%.*s "
-                                    "msg=%.*s → terminal (sink)\n",
-                                    (int) topic_len, topic_start,
-                                    (int) midlen, mp);
+                                if (parent_start) {
+                                    fprintf(stdout,
+                                        "workflow: consumed topic=%.*s "
+                                        "msg=%.*s parent=%.*s "
+                                        "→ terminal (sink)\n",
+                                        (int) topic_len, topic_start,
+                                        (int) midlen, mp,
+                                        (int) parent_len, parent_start);
+                                } else {
+                                    fprintf(stdout,
+                                        "workflow: consumed topic=%.*s "
+                                        "msg=%.*s (root) "
+                                        "→ terminal (sink)\n",
+                                        (int) topic_len, topic_start,
+                                        (int) midlen, mp);
+                                }
                             }
                             fflush(stdout);
                         }
