@@ -115,6 +115,10 @@ import Amalgame.String
     static int _pollen_cond_current = -1;
     /* Phase 5.3 — same hoist for the set-op queue counter. */
     static int _pollen_n_set_ops = 0;
+    /* Phase 5.4 — for / while route active flags, hoisted for
+     * reload_begin clear. Full struct + setters live below. */
+    static int _pollen_for_active = 0;
+    static int _pollen_while_active = 0;
 
     /* Phase 3.3 — hot-reload guard. Single mutex around the
      * workflow state: writer (AM-side watcher thread reload)
@@ -650,6 +654,9 @@ import Amalgame.String
         _pollen_cond_current = -1;
         /* Phase 5.3 — drop pending state set-ops on reload. */
         _pollen_n_set_ops = 0;
+        /* Phase 5.4 — drop loop routing on reload. */
+        _pollen_for_active = 0;
+        _pollen_while_active = 0;
         /* _pollen_wf_active stays sticky — once a node has loaded
          * a workflow, free-form fallback no longer kicks in even if
          * the new file is empty. Operator can restart to disable. */
@@ -698,12 +705,12 @@ import Amalgame.String
             send(fd, envelope, env_len, MSG_NOSIGNAL);
             send(fd, "\n", 1, MSG_NOSIGNAL);
         }
-        /* Half-close to let next-node know there's no more data
-         * coming. We don't bother reading its ACK back — for
-         * Phase 3.2 the forward is fire-and-pipeline. */
-        shutdown(fd, SHUT_WR);
-        char throwaway[256];
-        while (recv(fd, throwaway, sizeof(throwaway), 0) > 0) {}
+        /* Fire-and-forget close. The earlier code did SHUT_WR +
+         * drain-until-EOF for graceful close, but that deadlocks
+         * on self-loop (Phase 5.4 `while`) because the receiver
+         * holds _pollen_wf_mutex through its whole forward chain,
+         * and we'd be blocked here waiting for it. The receiver's
+         * recv loop sees EOF on close() too. */
         close(fd);
     }
 
@@ -1329,6 +1336,38 @@ import Amalgame.String
         return 1;
     }
 
+    /* Read the first key of a JSON object expression. Returns the
+     * key name into `out_key` (max cap chars), and `out_key_len` is
+     * the actual length. 0 on failure. This is what disambiguates
+     * the eval dispatch — `_pollen_json_field` substring-searches
+     * the whole expr, which would treat `{"op":"+","right":{"const":1}}`
+     * as a const literal because "const" appears nested.
+     *
+     * Walks until the first `"`, copies until matching `"`. Cheaply
+     * handles whitespace between `{` and the key. */
+    static int _pollen_expr_outer_key(const char* expr, size_t expr_len,
+                                        char* out_key, size_t cap) {
+        const char* e = expr;
+        const char* end = expr + expr_len;
+        while (e < end && (*e == ' ' || *e == '\t' || *e == '\n' || *e == '\r')) e++;
+        if (e >= end || *e != '{') return 0;
+        e++;
+        while (e < end && (*e == ' ' || *e == '\t' || *e == '\n' || *e == '\r')) e++;
+        if (e >= end || *e != '"') return 0;
+        e++;
+        const char* k0 = e;
+        while (e < end && *e != '"') {
+            if (*e == '\\' && e + 1 < end) { e += 2; continue; }
+            e++;
+        }
+        if (e >= end) return 0;
+        size_t klen = (size_t)(e - k0);
+        if (klen == 0 || klen >= cap) return 0;
+        memcpy(out_key, k0, klen);
+        out_key[klen] = 0;
+        return 1;
+    }
+
     static int _pollen_eval_expr(const char* env, size_t env_len,
                                    const char* expr, size_t expr_len,
                                    _pollen_expr_val_t* out) {
@@ -1337,7 +1376,16 @@ import Amalgame.String
         out->str[0] = 0;
         const char* v; size_t vlen;
 
-        if (_pollen_json_field(expr, expr_len, "const", 5, &v, &vlen)) {
+        /* Pick the dispatch based on the outermost key of the
+         * expression object. Otherwise nested "const" / "var" / "op"
+         * inside a compound would shadow the real form. */
+        char outer_key[16];
+        if (!_pollen_expr_outer_key(expr, expr_len, outer_key, sizeof(outer_key))) {
+            return 0;
+        }
+
+        if (strcmp(outer_key, "const") == 0
+            && _pollen_json_field(expr, expr_len, "const", 5, &v, &vlen)) {
             if (vlen == 0) return 0;
             if (*v == '"') {
                 size_t slen = vlen >= 2 ? vlen - 2 : 0;
@@ -1355,7 +1403,8 @@ import Amalgame.String
             return 1;
         }
 
-        if (_pollen_json_field(expr, expr_len, "var", 3, &v, &vlen)) {
+        if (strcmp(outer_key, "var") == 0
+            && _pollen_json_field(expr, expr_len, "var", 3, &v, &vlen)) {
             if (vlen < 2 || *v != '"') return 0;
             char path[POLLEN_COND_VAR_MAX];
             size_t plen = vlen - 2;
@@ -1405,7 +1454,8 @@ import Amalgame.String
             return 1;
         }
 
-        if (_pollen_json_field(expr, expr_len, "op", 2, &v, &vlen)) {
+        if (strcmp(outer_key, "op") == 0
+            && _pollen_json_field(expr, expr_len, "op", 2, &v, &vlen)) {
             if (vlen < 2 || *v != '"') return 0;
             char op[16];
             size_t olen = vlen - 2;
@@ -1598,6 +1648,260 @@ import Amalgame.String
         }
         fprintf(stdout, "tree-if: no branch matched → drop\n");
         fflush(stdout);
+    }
+
+    /* ── Phase 5.4 — `for` loop (per-item fan-out) ──────────────
+     *
+     * `for var in [items] do <action>` clones the message N times
+     * (one per item). Before each dispatch, `state.<var>` is set to
+     * the item's JSON literal so the downstream node can read it.
+     * Items are static literals captured at workflow-load time and
+     * stay constant across all messages.
+     *
+     * Limitation : `do` must resolve to a single dispatcher target.
+     * Phase 5.4.1 will extend to multi-target `do`. */
+    #define POLLEN_FOR_MAX_ITEMS 32
+    #define POLLEN_FOR_ITEM_MAX  256
+
+    typedef struct {
+        char items[POLLEN_FOR_MAX_ITEMS][POLLEN_FOR_ITEM_MAX];
+        int  n_items;
+        char item_var[POLLEN_COND_VAR_MAX];
+        char target_host[POLLEN_HOST_MAX];
+        int  target_port;
+    } pollen_for_route_t;
+
+    static pollen_for_route_t _pollen_for_route;
+
+    static void _pollen_for_setup(const char* var,
+                                    const char* host, int port) {
+        _pollen_for_active = 1;
+        _pollen_for_route.n_items = 0;
+        strncpy(_pollen_for_route.item_var, var ? var : "item",
+                 POLLEN_COND_VAR_MAX - 1);
+        _pollen_for_route.item_var[POLLEN_COND_VAR_MAX - 1] = 0;
+        strncpy(_pollen_for_route.target_host, host ? host : "",
+                 POLLEN_HOST_MAX - 1);
+        _pollen_for_route.target_host[POLLEN_HOST_MAX - 1] = 0;
+        _pollen_for_route.target_port = port;
+    }
+
+    static void _pollen_for_add_item(const char* item_lit) {
+        if (_pollen_for_route.n_items >= POLLEN_FOR_MAX_ITEMS) return;
+        strncpy(_pollen_for_route.items[_pollen_for_route.n_items],
+                 item_lit ? item_lit : "null",
+                 POLLEN_FOR_ITEM_MAX - 1);
+        _pollen_for_route.items[_pollen_for_route.n_items][POLLEN_FOR_ITEM_MAX - 1] = 0;
+        _pollen_for_route.n_items++;
+    }
+
+    static void _pollen_for_forward(const char* env, size_t env_len,
+                                      char* out_new_mid) {
+        char root[64];
+        int have_root = _pollen_extract_root_mid(env, env_len, root, sizeof(root));
+        const char* var = _pollen_for_route.item_var;
+        char state_path[POLLEN_COND_VAR_MAX + 8];
+        if (strncmp(var, "state.", 6) == 0) {
+            snprintf(state_path, sizeof(state_path), "%s", var);
+        } else {
+            snprintf(state_path, sizeof(state_path), "state.%s", var);
+        }
+        for (int i = 0; i < _pollen_for_route.n_items; i++) {
+            const char* item = _pollen_for_route.items[i];
+            if (have_root) {
+                if (_pollen_state_set(root, state_path, item)) {
+                    fprintf(stdout, "for-loop: iter[%d] %s = %s (root=%s)\n",
+                        i, state_path, item, root);
+                }
+            }
+            char rebuilt[8192];
+            const char* new_topic = _pollen_wf_emit_topic[0]
+                                    ? _pollen_wf_emit_topic : NULL;
+            size_t rn = _pollen_wf_rebuild_envelope(env, env_len,
+                                                     rebuilt, sizeof(rebuilt),
+                                                     new_topic, out_new_mid);
+            const char* fwd = rn > 0 ? rebuilt : env;
+            size_t fwd_len = rn > 0 ? rn : env_len;
+            _pollen_wf_forward_one(_pollen_for_route.target_host,
+                                    _pollen_for_route.target_port,
+                                    fwd, fwd_len);
+        }
+        fprintf(stdout, "for-loop: fanned out %d iterations to %s:%d\n",
+            _pollen_for_route.n_items,
+            _pollen_for_route.target_host,
+            _pollen_for_route.target_port);
+        fflush(stdout);
+    }
+
+    /* ── Phase 5.4 — `while` loop (self-loop with cond + maxIter) ──
+     *
+     * After the parent role finishes, the while step re-evaluates :
+     *   - cond true  AND iter < maxIter → forward to self (loop)
+     *   - else                          → forward to exit targets
+     * A hidden iter counter is auto-managed under a state key
+     * derived from the role name + a per-while suffix so multiple
+     * while loops on different roles don't collide. The cond can
+     * reference state.X / data.X via the same path syntax as `if`.
+     *
+     * Limitation : single-leaf cond (op + var + value). Phase 5.4.1
+     * will accept composite expressions. */
+    typedef struct {
+        /* Cond leaf */
+        char  var_path[POLLEN_COND_VAR_MAX];
+        int   op;
+        int   rhs_is_num;
+        double rhs_num;
+        char  rhs_str[POLLEN_COND_STR_MAX];
+        /* Auto-iter slot in the state file */
+        char  iter_state_key[POLLEN_COND_VAR_MAX];
+        int   max_iter;
+        /* Loop target = self */
+        char  loop_host[POLLEN_HOST_MAX];
+        int   loop_port;
+        /* Exit targets = whatever follows the while in the outer
+         * sequence. Reuse the same MAX_NEXTS sizing. */
+        char  exit_host[POLLEN_MAX_NEXTS][POLLEN_HOST_MAX];
+        int   exit_port[POLLEN_MAX_NEXTS];
+        int   n_exits;
+    } pollen_while_route_t;
+
+    static pollen_while_route_t _pollen_while_route;
+
+    static void _pollen_while_setup_s(const char* var_path,
+                                        const char* op_str,
+                                        int rhs_is_num, double rhs_num,
+                                        const char* rhs_str,
+                                        const char* iter_key,
+                                        int max_iter,
+                                        const char* self_host,
+                                        int self_port) {
+        _pollen_while_active = 1;
+        int op = POLLEN_COND_NONE;
+        if (op_str && op_str[0]) {
+            if      (!strcmp(op_str, "==")) op = POLLEN_COND_EQ;
+            else if (!strcmp(op_str, "!=")) op = POLLEN_COND_NE;
+            else if (!strcmp(op_str, "<"))  op = POLLEN_COND_LT;
+            else if (!strcmp(op_str, ">"))  op = POLLEN_COND_GT;
+            else if (!strcmp(op_str, "<=")) op = POLLEN_COND_LE;
+            else if (!strcmp(op_str, ">=")) op = POLLEN_COND_GE;
+        }
+        strncpy(_pollen_while_route.var_path, var_path ? var_path : "",
+                 POLLEN_COND_VAR_MAX - 1);
+        _pollen_while_route.var_path[POLLEN_COND_VAR_MAX - 1] = 0;
+        _pollen_while_route.op = op;
+        _pollen_while_route.rhs_is_num = rhs_is_num;
+        _pollen_while_route.rhs_num = rhs_num;
+        strncpy(_pollen_while_route.rhs_str, rhs_str ? rhs_str : "",
+                 POLLEN_COND_STR_MAX - 1);
+        _pollen_while_route.rhs_str[POLLEN_COND_STR_MAX - 1] = 0;
+        strncpy(_pollen_while_route.iter_state_key,
+                 iter_key ? iter_key : "_wf_iter",
+                 POLLEN_COND_VAR_MAX - 1);
+        _pollen_while_route.iter_state_key[POLLEN_COND_VAR_MAX - 1] = 0;
+        _pollen_while_route.max_iter = max_iter > 0 ? max_iter : 100;
+        strncpy(_pollen_while_route.loop_host, self_host ? self_host : "",
+                 POLLEN_HOST_MAX - 1);
+        _pollen_while_route.loop_host[POLLEN_HOST_MAX - 1] = 0;
+        _pollen_while_route.loop_port = self_port;
+        _pollen_while_route.n_exits = 0;
+    }
+
+    static void _pollen_while_add_exit(const char* host, int port) {
+        if (_pollen_while_route.n_exits >= POLLEN_MAX_NEXTS) return;
+        strncpy(_pollen_while_route.exit_host[_pollen_while_route.n_exits],
+                 host ? host : "", POLLEN_HOST_MAX - 1);
+        _pollen_while_route.exit_host[_pollen_while_route.n_exits][POLLEN_HOST_MAX - 1] = 0;
+        _pollen_while_route.exit_port[_pollen_while_route.n_exits] = port;
+        _pollen_while_route.n_exits++;
+    }
+
+    /* Read iter from state, evaluate user cond, decide loop vs exit.
+     * On loop : increment iter, forward to self. On exit : forward
+     * to each exit target. The auto-iter is checked BEFORE the user
+     * cond so a runaway loop always terminates eventually. */
+    static void _pollen_while_forward(const char* env, size_t env_len,
+                                        char* out_new_mid) {
+        char root[64];
+        int have_root = _pollen_extract_root_mid(env, env_len, root, sizeof(root));
+        int iter = 0;
+        if (have_root) {
+            char state_buf[POLLEN_STATE_FILE_MAX];
+            int sn = _pollen_state_read(root, state_buf, sizeof(state_buf));
+            if (sn > 0) {
+                const char* vp; size_t vl;
+                if (_pollen_resolve_path(state_buf, (size_t) sn,
+                                           _pollen_while_route.iter_state_key,
+                                           &vp, &vl)) {
+                    char tmp[32];
+                    size_t cn = vl < sizeof(tmp) - 1 ? vl : sizeof(tmp) - 1;
+                    memcpy(tmp, vp, cn); tmp[cn] = 0;
+                    iter = atoi(tmp);
+                }
+            }
+        }
+
+        int hit_max = (iter >= _pollen_while_route.max_iter);
+        /* Build a transient cond branch for eval reuse. */
+        pollen_cond_branch_t leaf;
+        strncpy(leaf.var_path, _pollen_while_route.var_path,
+                 POLLEN_COND_VAR_MAX - 1);
+        leaf.var_path[POLLEN_COND_VAR_MAX - 1] = 0;
+        leaf.op = _pollen_while_route.op;
+        leaf.rhs_is_num = _pollen_while_route.rhs_is_num;
+        leaf.rhs_num = _pollen_while_route.rhs_num;
+        strncpy(leaf.rhs_str, _pollen_while_route.rhs_str,
+                 POLLEN_COND_STR_MAX - 1);
+        leaf.rhs_str[POLLEN_COND_STR_MAX - 1] = 0;
+        int cond_pass = _pollen_cond_eval(&leaf, env, env_len);
+
+        if (!hit_max && cond_pass) {
+            /* Loop iteration : bump iter, forward to self. */
+            if (have_root) {
+                char lit[32];
+                snprintf(lit, sizeof(lit), "%d", iter + 1);
+                _pollen_state_set(root,
+                                    _pollen_while_route.iter_state_key,
+                                    lit);
+            }
+            char rebuilt[8192];
+            const char* new_topic = _pollen_wf_emit_topic[0]
+                                    ? _pollen_wf_emit_topic : NULL;
+            size_t rn = _pollen_wf_rebuild_envelope(env, env_len,
+                                                     rebuilt, sizeof(rebuilt),
+                                                     new_topic, out_new_mid);
+            const char* fwd = rn > 0 ? rebuilt : env;
+            size_t fwd_len = rn > 0 ? rn : env_len;
+            _pollen_wf_forward_one(_pollen_while_route.loop_host,
+                                    _pollen_while_route.loop_port,
+                                    fwd, fwd_len);
+            fprintf(stdout, "while-loop: iter=%d → loop to %s:%d\n",
+                iter + 1,
+                _pollen_while_route.loop_host,
+                _pollen_while_route.loop_port);
+            fflush(stdout);
+            return;
+        }
+
+        /* Exit branch. */
+        const char* reason = hit_max ? "maxIter" : "cond false";
+        fprintf(stdout, "while-loop: exit at iter=%d (%s) → %d exit target(s)\n",
+            iter, reason, _pollen_while_route.n_exits);
+        fflush(stdout);
+        if (_pollen_while_route.n_exits == 0) return;
+
+        char rebuilt[8192];
+        const char* new_topic = _pollen_wf_emit_topic[0]
+                                ? _pollen_wf_emit_topic : NULL;
+        size_t rn = _pollen_wf_rebuild_envelope(env, env_len,
+                                                 rebuilt, sizeof(rebuilt),
+                                                 new_topic, out_new_mid);
+        const char* fwd = rn > 0 ? rebuilt : env;
+        size_t fwd_len = rn > 0 ? rn : env_len;
+        for (int i = 0; i < _pollen_while_route.n_exits; i++) {
+            _pollen_wf_forward_one(_pollen_while_route.exit_host[i],
+                                    _pollen_while_route.exit_port[i],
+                                    fwd, fwd_len);
+        }
     }
 
     /* Portable substring search — memmem is glibc-only and _GNU_SOURCE
@@ -2033,7 +2337,77 @@ import Amalgame.String
                             _pollen_set_ops_apply(fwd_buf, fwd_buf_len);
 
                             char fwd_new_mid[37] = {0};
-                            if (_pollen_cond_active) {
+                            if (_pollen_while_active) {
+                                /* Phase 5.4 — while loop. Either
+                                 * forwards to self (loop body) or to
+                                 * exit targets after cond/maxIter
+                                 * resolution. */
+                                _pollen_while_forward(fwd_buf, fwd_buf_len,
+                                                       fwd_new_mid);
+                                if (parent_start) {
+                                    fprintf(stdout,
+                                        "workflow: consumed topic=%.*s "
+                                        "msg=%.*s parent=%.*s "
+                                        "→ while-route (emit topic=%s)\n",
+                                        (int) topic_len, topic_start,
+                                        (int) midlen, mp,
+                                        (int) parent_len, parent_start,
+                                        _pollen_wf_emit_topic[0] ? _pollen_wf_emit_topic : "(verbatim)");
+                                } else {
+                                    fprintf(stdout,
+                                        "workflow: consumed topic=%.*s "
+                                        "msg=%.*s (root) "
+                                        "→ while-route (emit topic=%s)\n",
+                                        (int) topic_len, topic_start,
+                                        (int) midlen, mp,
+                                        _pollen_wf_emit_topic[0] ? _pollen_wf_emit_topic : "(verbatim)");
+                                }
+                                if (fwd_new_mid[0]) {
+                                    _pollen_wf_record_step(
+                                        fwd_new_mid, 36,
+                                        mp, midlen,
+                                        topic_start, topic_len,
+                                        _pollen_wf_emit_topic[0] ?
+                                            _pollen_wf_emit_topic : NULL,
+                                        1,
+                                        dbg_session, dbg_session_len);
+                                }
+                            } else if (_pollen_for_active) {
+                                /* Phase 5.4 — for loop. Fans out one
+                                 * copy per item, setting state.<var>
+                                 * to the item literal before each
+                                 * dispatch. */
+                                _pollen_for_forward(fwd_buf, fwd_buf_len,
+                                                     fwd_new_mid);
+                                if (parent_start) {
+                                    fprintf(stdout,
+                                        "workflow: consumed topic=%.*s "
+                                        "msg=%.*s parent=%.*s "
+                                        "→ for-route (emit topic=%s)\n",
+                                        (int) topic_len, topic_start,
+                                        (int) midlen, mp,
+                                        (int) parent_len, parent_start,
+                                        _pollen_wf_emit_topic[0] ? _pollen_wf_emit_topic : "(verbatim)");
+                                } else {
+                                    fprintf(stdout,
+                                        "workflow: consumed topic=%.*s "
+                                        "msg=%.*s (root) "
+                                        "→ for-route (emit topic=%s)\n",
+                                        (int) topic_len, topic_start,
+                                        (int) midlen, mp,
+                                        _pollen_wf_emit_topic[0] ? _pollen_wf_emit_topic : "(verbatim)");
+                                }
+                                if (fwd_new_mid[0]) {
+                                    _pollen_wf_record_step(
+                                        fwd_new_mid, 36,
+                                        mp, midlen,
+                                        topic_start, topic_len,
+                                        _pollen_wf_emit_topic[0] ?
+                                            _pollen_wf_emit_topic : NULL,
+                                        1,
+                                        dbg_session, dbg_session_len);
+                                }
+                            } else if (_pollen_cond_active) {
                                 /* Phase 5.2 — conditional routing.
                                  * Branches were resolved at load
                                  * time ; here we just pick the first
@@ -2430,6 +2804,34 @@ public class Program {
         return out
     }
 
+    // Phase 5.4 — for `while`, return the step that immediately
+    // follows the while dispatcher in the outer sequence. That's
+    // where exit-branch routing goes when the loop terminates.
+    // Skips `set` steps the same way as FindDispatcherAfter.
+    public static JsonValue FindStepAfterDispatcher(JsonValue treeV, string role) {
+        let empty: JsonValue = new JsonValue()
+        if (!treeV.IsObject()) { return empty }
+        if (treeV.Get("type").AsString() != "sequence") { return empty }
+        let stepsV: JsonValue = treeV.Get("steps")
+        if (!stepsV.IsArray()) { return empty }
+        let steps: List<JsonValue> = stepsV.AsArray()
+        let n: int = steps.Count()
+        var found: int = -1
+        for i in 0..n {
+            if (Program.StepNames(steps.Get(i), role)) { found = i; break }
+        }
+        if (found < 0) { return empty }
+        var j: int = found + 1
+        while (j < n) {
+            let s: JsonValue = steps.Get(j)
+            if (!s.IsObject()) { return empty }
+            if (s.Get("type").AsString() != "set") { break }
+            j = j + 1
+        }
+        if (j + 1 < n) { return steps.Get(j + 1) }
+        return empty
+    }
+
     // Return the first non-`set` action after role's step. Skips
     // over any number of `set` steps so dispatch lookup sees what
     // would naturally come next once the state mutations are done.
@@ -2603,7 +3005,95 @@ public class Program {
             if (nextAction.IsObject()) {
                 nextKind = nextAction.Get("type").AsString()
             }
-            if (nextKind == "if") {
+            if (nextKind == "for") {
+                nxtSrcTag = "tree.for"
+                let varV: JsonValue   = nextAction.Get("var")
+                let inV:  JsonValue   = nextAction.Get("in")
+                let doV:  JsonValue   = nextAction.Get("do")
+                let itemVar: string = varV.AsString()
+                if (String_Length(itemVar) == 0) { itemVar = "item" }
+                // Resolve do → single target role for MVP.
+                var targetHost: string = ""
+                var targetPort: int = 0
+                if (doV.IsObject()) {
+                    let targets: List<string> = Program.ActionTargets(doV)
+                    if (targets.Count() > 0) {
+                        let tRole: string = targets.Get(0)
+                        let tNode: JsonValue = Program.FindNodeByKey(nodesV, tRole)
+                        if (tNode.IsObject()) {
+                            targetHost = tNode.Get("host").AsString()
+                            targetPort = tNode.Get("port").AsInt()
+                        }
+                    }
+                }
+                @c { _pollen_for_setup(itemVar, targetHost, (int) targetPort); }
+                var inner: string = "for(" + itemVar + ")→" + targetHost + ":" + String_FromInt(targetPort)
+                if (inV.IsArray()) {
+                    let items: List<JsonValue> = inV.AsArray()
+                    let ic: int = items.Count()
+                    for ii in 0..ic {
+                        let it: JsonValue = items.Get(ii)
+                        let itLit: string = Json.Encode(it)
+                        @c { _pollen_for_add_item(itLit); }
+                    }
+                    inner = inner + "×" + String_FromInt(ic)
+                }
+                nxtSReal = inner
+            } else if (nextKind == "while") {
+                nxtSrcTag = "tree.while"
+                let condV: JsonValue   = nextAction.Get("cond")
+                let maxV:  JsonValue   = nextAction.Get("maxIter")
+                var op: string = ""
+                var varP: string = ""
+                var isNum: int  = 0
+                var numVal: float = 0.0
+                var strVal: string = ""
+                if (condV.IsObject()) {
+                    op   = condV.Get("op").AsString()
+                    varP = condV.Get("var").AsString()
+                    let valV: JsonValue = condV.Get("value")
+                    if (valV.IsNumber()) {
+                        isNum = 1
+                        if (valV.IsInt()) {
+                            let iv: int = valV.AsInt()
+                            numVal = iv * 1.0
+                        } else {
+                            numVal = valV.AsFloat()
+                        }
+                    } else if (valV.IsString()) {
+                        strVal = valV.AsString()
+                    } else if (valV.IsBool()) {
+                        if (valV.AsBool()) { strVal = "true" } else { strVal = "false" }
+                    }
+                }
+                var maxIter: int = 100
+                if (maxV.IsInt()) { maxIter = maxV.AsInt() }
+                // Self host:port = me's port + actualPort
+                let selfHost: string = me.Get("host").AsString()
+                let selfPort: int    = actualPort
+                let iterKey: string = "_wf_iter_" + role
+                @c { _pollen_while_setup_s(varP, op, (int) isNum, (double) numVal, strVal,
+                                            iterKey, (int) maxIter,
+                                            selfHost, (int) selfPort); }
+                // Exit targets = action after the while.
+                let exitAction: JsonValue = Program.FindStepAfterDispatcher(treeV, role)
+                var inner: string = "while(" + varP + " " + op + ")→self+exits"
+                if (exitAction.IsObject()) {
+                    let exitTargets: List<string> = Program.ActionTargets(exitAction)
+                    let ec: int = exitTargets.Count()
+                    for ei in 0..ec {
+                        let er: string = exitTargets.Get(ei)
+                        let en: JsonValue = Program.FindNodeByKey(nodesV, er)
+                        if (en.IsObject()) {
+                            let eh: string = en.Get("host").AsString()
+                            let ep: int    = en.Get("port").AsInt()
+                            @c { _pollen_while_add_exit(eh, (int) ep); }
+                        }
+                    }
+                    inner = inner + " exits=" + String_FromInt(ec)
+                }
+                nxtSReal = inner
+            } else if (nextKind == "if") {
                 nxtSrcTag = "tree.if"
                 let branchesV: JsonValue = nextAction.Get("branches")
                 if (branchesV.IsArray()) {
