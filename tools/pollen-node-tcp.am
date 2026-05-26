@@ -1747,7 +1747,10 @@ import Amalgame.String
      * stay constant across all messages.
      *
      * Limitation : `do` must resolve to a single dispatcher target.
-     * Phase 5.4.1 will extend to multi-target `do`. */
+     * Phase 5.4.3 extended to multi-target `do` (do can be a
+     * fan_out, a sequence, or any composite — we register every
+     * resolvable target). Each iteration sets state.<var> to the
+     * current item, then forwards to all targets in turn. */
     #define POLLEN_FOR_MAX_ITEMS 32
     #define POLLEN_FOR_ITEM_MAX  256
 
@@ -1755,23 +1758,30 @@ import Amalgame.String
         char items[POLLEN_FOR_MAX_ITEMS][POLLEN_FOR_ITEM_MAX];
         int  n_items;
         char item_var[POLLEN_COND_VAR_MAX];
-        char target_host[POLLEN_HOST_MAX];
-        int  target_port;
+        /* Phase 5.4.3 — array of (host, port) targets (was single). */
+        char target_host[POLLEN_MAX_NEXTS][POLLEN_HOST_MAX];
+        int  target_port[POLLEN_MAX_NEXTS];
+        int  n_targets;
     } pollen_for_route_t;
 
     static pollen_for_route_t _pollen_for_route;
 
-    static void _pollen_for_setup(const char* var,
-                                    const char* host, int port) {
+    static void _pollen_for_setup(const char* var) {
         _pollen_for_active = 1;
         _pollen_for_route.n_items = 0;
+        _pollen_for_route.n_targets = 0;
         strncpy(_pollen_for_route.item_var, var ? var : "item",
                  POLLEN_COND_VAR_MAX - 1);
         _pollen_for_route.item_var[POLLEN_COND_VAR_MAX - 1] = 0;
-        strncpy(_pollen_for_route.target_host, host ? host : "",
-                 POLLEN_HOST_MAX - 1);
-        _pollen_for_route.target_host[POLLEN_HOST_MAX - 1] = 0;
-        _pollen_for_route.target_port = port;
+    }
+
+    static void _pollen_for_add_target(const char* host, int port) {
+        if (_pollen_for_route.n_targets >= POLLEN_MAX_NEXTS) return;
+        strncpy(_pollen_for_route.target_host[_pollen_for_route.n_targets],
+                 host ? host : "", POLLEN_HOST_MAX - 1);
+        _pollen_for_route.target_host[_pollen_for_route.n_targets][POLLEN_HOST_MAX - 1] = 0;
+        _pollen_for_route.target_port[_pollen_for_route.n_targets] = port;
+        _pollen_for_route.n_targets++;
     }
 
     static void _pollen_for_add_item(const char* item_lit) {
@@ -1794,6 +1804,7 @@ import Amalgame.String
         } else {
             snprintf(state_path, sizeof(state_path), "state.%s", var);
         }
+        int total = 0;
         for (int i = 0; i < _pollen_for_route.n_items; i++) {
             const char* item = _pollen_for_route.items[i];
             if (have_root) {
@@ -1810,14 +1821,16 @@ import Amalgame.String
                                                      new_topic, out_new_mid);
             const char* fwd = rn > 0 ? rebuilt : env;
             size_t fwd_len = rn > 0 ? rn : env_len;
-            _pollen_wf_forward_one(_pollen_for_route.target_host,
-                                    _pollen_for_route.target_port,
-                                    fwd, fwd_len);
+            for (int t = 0; t < _pollen_for_route.n_targets; t++) {
+                _pollen_wf_forward_one(_pollen_for_route.target_host[t],
+                                        _pollen_for_route.target_port[t],
+                                        fwd, fwd_len);
+                total++;
+            }
         }
-        fprintf(stdout, "for-loop: fanned out %d iterations to %s:%d\n",
-            _pollen_for_route.n_items,
-            _pollen_for_route.target_host,
-            _pollen_for_route.target_port);
+        fprintf(stdout,
+            "for-loop: fanned out %d iter(s) × %d target(s) = %d msg(s)\n",
+            _pollen_for_route.n_items, _pollen_for_route.n_targets, total);
         fflush(stdout);
     }
 
@@ -3144,22 +3157,27 @@ public class Program {
                 let doV:  JsonValue   = nextAction.Get("do")
                 let itemVar: string = varV.AsString()
                 if (String_Length(itemVar) == 0) { itemVar = "item" }
-                // Resolve do → single target role for MVP.
-                var targetHost: string = ""
-                var targetPort: int = 0
+                @c { _pollen_for_setup(itemVar); }
+                // Phase 5.4.3 — iterate every dispatchable target of
+                // do (call → 1, fan_out → N, sequence → first non-set
+                // step's targets via ActionTargets recursion).
+                var targetSummary: string = ""
                 if (doV.IsObject()) {
                     let targets: List<string> = Program.ActionTargets(doV)
-                    if (targets.Count() > 0) {
-                        let tRole: string = targets.Get(0)
+                    let tn: int = targets.Count()
+                    for ti in 0..tn {
+                        let tRole: string = targets.Get(ti)
                         let tNode: JsonValue = Program.FindNodeByKey(nodesV, tRole)
                         if (tNode.IsObject()) {
-                            targetHost = tNode.Get("host").AsString()
-                            targetPort = tNode.Get("port").AsInt()
+                            let th: string = tNode.Get("host").AsString()
+                            let tp: int    = tNode.Get("port").AsInt()
+                            @c { _pollen_for_add_target(th, (int) tp); }
+                            if (String_Length(targetSummary) > 0) { targetSummary = targetSummary + "," }
+                            targetSummary = targetSummary + tRole
                         }
                     }
                 }
-                @c { _pollen_for_setup(itemVar, targetHost, (int) targetPort); }
-                var inner: string = "for(" + itemVar + ")→" + targetHost + ":" + String_FromInt(targetPort)
+                var inner: string = "for(" + itemVar + ")→[" + targetSummary + "]"
                 if (inV.IsArray()) {
                     let items: List<JsonValue> = inV.AsArray()
                     let ic: int = items.Count()
