@@ -2802,6 +2802,25 @@ public class Program {
                 let s: string = nodes.Get(i).AsString()
                 if (String_Length(s) > 0) { out.Add(s) }
             }
+            return out
+        }
+        // Phase 5.4.2 — recurse into nested constructs to find the
+        // first dispatchable target. Used when an if-branch's
+        // `then` is a sub-sequence : we want the role at the top
+        // of that sequence as the actual fan-out destination.
+        if (kind == "sequence") {
+            let stepsV: JsonValue = actionV.Get("steps")
+            if (!stepsV.IsArray()) { return out }
+            let steps: List<JsonValue> = stepsV.AsArray()
+            let sn: int = steps.Count()
+            for i in 0..sn {
+                let s: JsonValue = steps.Get(i)
+                if (!s.IsObject()) { continue }
+                let st: string = s.Get("type").AsString()
+                if (st == "set") { continue }
+                // First non-set step : recurse to extract its targets.
+                return Program.ActionTargets(s)
+            }
         }
         return out
     }
@@ -2832,18 +2851,85 @@ public class Program {
         return empty
     }
 
-    // Phase 5.3 — return the list of `set` step JsonValues between
-    // role's step and the next dispatcher (call / fan_out / if /
-    // end). The caller iterates these to register set ops, then
-    // calls FindDispatcherAfter to get the actual dispatch action.
+    // Phase 5.4.2 — recursive walker. Returns the sequence-steps
+    // list that directly contains `role`'s step, whether the role
+    // lives in the top-level sequence or nested inside an `if`
+    // branch / `for` body. A 1-step "synthetic" sequence is returned
+    // when role is named by a single leaf action (e.g. an `if`
+    // branch whose `then` is just a `call(role)` with no surrounding
+    // sequence) — that role is terminal within its branch but
+    // still gets a consistent shape for downstream helpers.
+    //
+    // Note : if role appears in multiple places, the first match in
+    // pre-order is returned. Same-role-in-multiple-branches with
+    // different post-actions is genuinely ambiguous at runtime (the
+    // role doesn't know which branch it came from), so we just pick
+    // the first.
+    public static List<JsonValue> FindRoleSequence(JsonValue action, string role) {
+        let empty: List<JsonValue> = new List<JsonValue>()
+        if (!action.IsObject()) { return empty }
+        let kind: string = action.Get("type").AsString()
+
+        if (kind == "sequence") {
+            let stepsV: JsonValue = action.Get("steps")
+            if (!stepsV.IsArray()) { return empty }
+            let steps: List<JsonValue> = stepsV.AsArray()
+            let n: int = steps.Count()
+            // 1. Role directly named at this level → return THIS seq.
+            for i in 0..n {
+                if (Program.StepNames(steps.Get(i), role)) {
+                    return steps
+                }
+            }
+            // 2. Recurse into nested constructs.
+            for i in 0..n {
+                let nested: List<JsonValue> = Program.FindRoleSequence(steps.Get(i), role)
+                if (nested.Count() > 0) { return nested }
+            }
+            return empty
+        }
+
+        if (kind == "if") {
+            let branchesV: JsonValue = action.Get("branches")
+            if (!branchesV.IsArray()) { return empty }
+            let branches: List<JsonValue> = branchesV.AsArray()
+            let bn: int = branches.Count()
+            for bi in 0..bn {
+                let br: JsonValue = branches.Get(bi)
+                if (!br.IsObject()) { continue }
+                let thenV: JsonValue = br.Get("then")
+                if (!thenV.IsObject()) { continue }
+                let nested: List<JsonValue> = Program.FindRoleSequence(thenV, role)
+                if (nested.Count() > 0) { return nested }
+            }
+            return empty
+        }
+
+        if (kind == "for") {
+            let doV: JsonValue = action.Get("do")
+            if (doV.IsObject()) {
+                return Program.FindRoleSequence(doV, role)
+            }
+            return empty
+        }
+
+        // Leaf : call / fan_out / set / end / while.
+        // (while doesn't carry a body of its own — self-loop only.)
+        if (Program.StepNames(action, role)) {
+            let one: List<JsonValue> = new List<JsonValue>()
+            one.Add(action)
+            return one
+        }
+        return empty
+    }
+
+    // Same as before but operates on the sequence containing role,
+    // wherever in the tree it lives.
     public static List<JsonValue> CollectSetsAfter(JsonValue treeV, string role) {
         let out: List<JsonValue> = new List<JsonValue>()
-        if (!treeV.IsObject()) { return out }
-        if (treeV.Get("type").AsString() != "sequence") { return out }
-        let stepsV: JsonValue = treeV.Get("steps")
-        if (!stepsV.IsArray()) { return out }
-        let steps: List<JsonValue> = stepsV.AsArray()
+        let steps: List<JsonValue> = Program.FindRoleSequence(treeV, role)
         let n: int = steps.Count()
+        if (n == 0) { return out }
         var found: int = -1
         for i in 0..n {
             if (Program.StepNames(steps.Get(i), role)) { found = i; break }
@@ -2861,17 +2947,12 @@ public class Program {
     }
 
     // Phase 5.4 — for `while`, return the step that immediately
-    // follows the while dispatcher in the outer sequence. That's
-    // where exit-branch routing goes when the loop terminates.
-    // Skips `set` steps the same way as FindDispatcherAfter.
+    // follows the while dispatcher in the containing sequence.
     public static JsonValue FindStepAfterDispatcher(JsonValue treeV, string role) {
         let empty: JsonValue = new JsonValue()
-        if (!treeV.IsObject()) { return empty }
-        if (treeV.Get("type").AsString() != "sequence") { return empty }
-        let stepsV: JsonValue = treeV.Get("steps")
-        if (!stepsV.IsArray()) { return empty }
-        let steps: List<JsonValue> = stepsV.AsArray()
+        let steps: List<JsonValue> = Program.FindRoleSequence(treeV, role)
         let n: int = steps.Count()
+        if (n == 0) { return empty }
         var found: int = -1
         for i in 0..n {
             if (Program.StepNames(steps.Get(i), role)) { found = i; break }
@@ -2888,17 +2969,12 @@ public class Program {
         return empty
     }
 
-    // Return the first non-`set` action after role's step. Skips
-    // over any number of `set` steps so dispatch lookup sees what
-    // would naturally come next once the state mutations are done.
+    // Return the first non-`set` action after role's step.
     public static JsonValue FindDispatcherAfter(JsonValue treeV, string role) {
         let empty: JsonValue = new JsonValue()
-        if (!treeV.IsObject()) { return empty }
-        if (treeV.Get("type").AsString() != "sequence") { return empty }
-        let stepsV: JsonValue = treeV.Get("steps")
-        if (!stepsV.IsArray()) { return empty }
-        let steps: List<JsonValue> = stepsV.AsArray()
+        let steps: List<JsonValue> = Program.FindRoleSequence(treeV, role)
         let n: int = steps.Count()
+        if (n == 0) { return empty }
         var found: int = -1
         for i in 0..n {
             if (Program.StepNames(steps.Get(i), role)) { found = i; break }
