@@ -1645,6 +1645,87 @@ import Amalgame.String
             return !_pollen_cond_eval_expr(env, env_len, arg, arg_len);
         }
 
+        /* Phase 6.0a — membership : {op:"in"|"not_in", var, values:[…]}.
+         * Resolves the variable, iterates `values`, true if any
+         * element string-matches (or none, for not_in). Common case
+         * is `data.tier in ["vip","gold"]` — string membership. */
+        if (strcmp(op, "in") == 0 || strcmp(op, "not_in") == 0) {
+            int negate = (op[0] == 'n');
+            const char* varTok; size_t varTokLen;
+            if (!_pollen_json_field(expr, expr_len, "var", 3,
+                                      &varTok, &varTokLen)) return 0;
+            if (varTokLen < 2 || *varTok != '"') return 0;
+            char vpath[POLLEN_COND_VAR_MAX];
+            size_t vplen = varTokLen - 2;
+            if (vplen >= sizeof(vpath)) vplen = sizeof(vpath) - 1;
+            memcpy(vpath, varTok + 1, vplen); vpath[vplen] = 0;
+
+            const char* lookup_buf = env;
+            size_t lookup_len = env_len;
+            const char* lookup_path = vpath;
+            char state_buf[POLLEN_STATE_FILE_MAX];
+            if (strncmp(vpath, "state.", 6) == 0) {
+                char root[64];
+                if (!_pollen_extract_root_mid(env, env_len,
+                                                root, sizeof(root))) return 0;
+                int sn = _pollen_state_read(root, state_buf, sizeof(state_buf));
+                if (sn <= 0) return 0;
+                lookup_buf = state_buf;
+                lookup_len = (size_t) sn;
+                lookup_path = vpath + 6;
+            }
+            const char* val_ptr; size_t val_len;
+            if (!_pollen_resolve_path(lookup_buf, lookup_len,
+                                        lookup_path, &val_ptr, &val_len)) {
+                return negate ? 1 : 0;
+            }
+
+            char v_str[128]; v_str[0] = 0;
+            if (val_len > 0 && *val_ptr == '"') {
+                size_t slen = val_len >= 2 ? val_len - 2 : 0;
+                if (slen >= sizeof(v_str)) slen = sizeof(v_str) - 1;
+                memcpy(v_str, val_ptr + 1, slen);
+                v_str[slen] = 0;
+            } else {
+                size_t cn = val_len < sizeof(v_str) - 1 ? val_len : sizeof(v_str) - 1;
+                memcpy(v_str, val_ptr, cn); v_str[cn] = 0;
+            }
+
+            const char* values; size_t values_len;
+            if (!_pollen_json_field(expr, expr_len, "values", 6,
+                                      &values, &values_len)) return 0;
+            if (values_len < 2 || *values != '[') return 0;
+            const char* p = values + 1;
+            const char* end = values + values_len - 1;
+            int found = 0;
+            while (p < end) {
+                while (p < end && (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n')) p++;
+                if (p >= end) break;
+                const char* tok = p;
+                char tok_buf[128]; tok_buf[0] = 0;
+                if (*p == '"') {
+                    p++;
+                    const char* q = p;
+                    while (q < end && *q != '"') {
+                        if (*q == '\\' && q + 1 < end) { q += 2; continue; }
+                        q++;
+                    }
+                    size_t slen = (size_t)(q - p);
+                    if (slen >= sizeof(tok_buf)) slen = sizeof(tok_buf) - 1;
+                    memcpy(tok_buf, p, slen); tok_buf[slen] = 0;
+                    p = (q < end) ? q + 1 : q;
+                } else {
+                    while (p < end && *p != ',' && *p != ']'
+                           && *p != ' ' && *p != '\n' && *p != '\r' && *p != '\t') p++;
+                    size_t slen = (size_t)(p - tok);
+                    if (slen >= sizeof(tok_buf)) slen = sizeof(tok_buf) - 1;
+                    memcpy(tok_buf, tok, slen); tok_buf[slen] = 0;
+                }
+                if (strcmp(tok_buf, v_str) == 0) { found = 1; break; }
+            }
+            return negate ? (found ? 0 : 1) : (found ? 1 : 0);
+        }
+
         /* Leaf comparison. Decode op code, var, value. */
         int op_code = POLLEN_COND_NONE;
         if      (strcmp(op, "==") == 0) op_code = POLLEN_COND_EQ;
