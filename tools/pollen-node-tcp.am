@@ -914,12 +914,14 @@ import Amalgame.String
     #define POLLEN_COND_LE     5
     #define POLLEN_COND_GE     6
 
+    /* Phase 5.4.1 — store cond as raw JSON so the eval can handle
+     * composite expressions ({"op":"and|or","args":[…]} and
+     * {"op":"not","arg":…}) in addition to leaf comparisons. Empty
+     * string = else branch / always true. */
+    #define POLLEN_COND_EXPR_MAX 1024
+
     typedef struct {
-        char    var_path[POLLEN_COND_VAR_MAX];
-        int     op;
-        int     rhs_is_num;
-        double  rhs_num;
-        char    rhs_str[POLLEN_COND_STR_MAX];
+        char    cond_expr[POLLEN_COND_EXPR_MAX];
         char    targets_host[POLLEN_MAX_NEXTS][POLLEN_HOST_MAX];
         int     targets_port[POLLEN_MAX_NEXTS];
         int     n_targets;
@@ -939,44 +941,17 @@ import Amalgame.String
         _pollen_cond_current = -1;
     }
 
-    static void _pollen_cond_branch_open(const char* var_path, int op,
-                                          int rhs_is_num, double rhs_num,
-                                          const char* rhs_str) {
+    /* Open a new branch. Empty cond_json = else / always-true. */
+    static void _pollen_cond_branch_open_expr(const char* cond_json) {
         if (_pollen_cond_n_branches >= POLLEN_COND_MAX_BRANCHES) return;
         _pollen_cond_active = 1;
         _pollen_cond_current = _pollen_cond_n_branches;
         pollen_cond_branch_t* b = &_pollen_cond_branches[_pollen_cond_current];
-        strncpy(b->var_path, var_path ? var_path : "", sizeof(b->var_path) - 1);
-        b->var_path[sizeof(b->var_path) - 1] = 0;
-        b->op = op;
-        b->rhs_is_num = rhs_is_num;
-        b->rhs_num = rhs_num;
-        strncpy(b->rhs_str, rhs_str ? rhs_str : "", sizeof(b->rhs_str) - 1);
-        b->rhs_str[sizeof(b->rhs_str) - 1] = 0;
+        strncpy(b->cond_expr, cond_json ? cond_json : "",
+                 sizeof(b->cond_expr) - 1);
+        b->cond_expr[sizeof(b->cond_expr) - 1] = 0;
         b->n_targets = 0;
         _pollen_cond_n_branches++;
-    }
-
-    /* AM-callable wrapper : op is passed as the JSON string ("==",
-     * ">", …) and resolved to the int code here. Empty op means
-     * `else` / always-true. */
-    static void _pollen_cond_branch_open_s(const char* var_path,
-                                             const char* op_str,
-                                             int rhs_is_num,
-                                             double rhs_num,
-                                             const char* rhs_str) {
-        int op = POLLEN_COND_NONE;
-        if (op_str && op_str[0]) {
-            if      (!strcmp(op_str, "==")) op = POLLEN_COND_EQ;
-            else if (!strcmp(op_str, "!=")) op = POLLEN_COND_NE;
-            else if (!strcmp(op_str, "<"))  op = POLLEN_COND_LT;
-            else if (!strcmp(op_str, ">"))  op = POLLEN_COND_GT;
-            else if (!strcmp(op_str, "<=")) op = POLLEN_COND_LE;
-            else if (!strcmp(op_str, ">=")) op = POLLEN_COND_GE;
-        }
-        _pollen_cond_branch_open(var_path ? var_path : "", op,
-                                  rhs_is_num, rhs_num,
-                                  rhs_str ? rhs_str : "");
     }
 
     static void _pollen_cond_branch_add_target(const char* host, int port) {
@@ -1528,21 +1503,21 @@ import Amalgame.String
         }
     }
 
-    /* Evaluate one branch's condition against the envelope. */
-    static int _pollen_cond_eval(pollen_cond_branch_t* b,
-                                   const char* env, size_t env_len) {
-        if (b->op == POLLEN_COND_NONE) return 1;  /* else / always */
-
-        /* Phase 5.3 — `state.X` resolves against the per-execution
-         * state file rather than the envelope.
-         * Phase 5.2.1 — dotted path resolution. `data.X` walks into
-         * the data object ; bare `X` looks at the envelope root. */
+    /* Phase 5.4.1 — leaf comparison. Walks dotted var path, parses
+     * value extent, applies op. Same body as the old eval, factored
+     * out so the composite walker can reuse it. */
+    static int _pollen_cond_eval_leaf(const char* env, size_t env_len,
+                                        const char* var_path,
+                                        int op_code,
+                                        int rhs_is_num,
+                                        double rhs_num,
+                                        const char* rhs_str) {
+        if (op_code == POLLEN_COND_NONE) return 1;
         const char* lookup_buf = env;
         size_t lookup_len = env_len;
-        const char* lookup_path = b->var_path;
+        const char* lookup_path = var_path;
         char state_buf[POLLEN_STATE_FILE_MAX];
-
-        if (strncmp(b->var_path, "state.", 6) == 0) {
+        if (strncmp(var_path, "state.", 6) == 0) {
             char root[64];
             if (!_pollen_extract_root_mid(env, env_len,
                                             root, sizeof(root))) return 0;
@@ -1550,24 +1525,17 @@ import Amalgame.String
             if (sn <= 0) return 0;
             lookup_buf = state_buf;
             lookup_len = (size_t) sn;
-            lookup_path = b->var_path + 6;
+            lookup_path = var_path + 6;
         }
-
         const char* val_ptr = NULL;
         size_t val_len = 0;
         if (!_pollen_resolve_path(lookup_buf, lookup_len, lookup_path,
                                     &val_ptr, &val_len)) return 0;
-
         const char* v = val_ptr;
         const char* v_end = val_ptr + val_len;
         if (v >= v_end) return 0;
-
         double v_num = 0; int v_is_num = 0;
         char v_str[128] = "";
-
-        /* val_ptr/val_len cover the raw value extent : for strings,
-         * leading-quote + content + trailing-quote ; for numbers /
-         * literals, just the token. */
         if (*v == '"') {
             const char* q = v_end - 1;
             if (q <= v) return 0;
@@ -1590,10 +1558,9 @@ import Amalgame.String
         } else {
             return 0;
         }
-
-        if (b->rhs_is_num && v_is_num) {
-            double d = v_num - b->rhs_num;
-            switch (b->op) {
+        if (rhs_is_num && v_is_num) {
+            double d = v_num - rhs_num;
+            switch (op_code) {
                 case POLLEN_COND_EQ: return d == 0;
                 case POLLEN_COND_NE: return d != 0;
                 case POLLEN_COND_LT: return d <  0;
@@ -1601,9 +1568,9 @@ import Amalgame.String
                 case POLLEN_COND_LE: return d <= 0;
                 case POLLEN_COND_GE: return d >= 0;
             }
-        } else if (!b->rhs_is_num) {
-            int c = strcmp(v_str, b->rhs_str);
-            switch (b->op) {
+        } else if (!rhs_is_num) {
+            int c = strcmp(v_str, rhs_str);
+            switch (op_code) {
                 case POLLEN_COND_EQ: return c == 0;
                 case POLLEN_COND_NE: return c != 0;
                 case POLLEN_COND_LT: return c <  0;
@@ -1613,6 +1580,127 @@ import Amalgame.String
             }
         }
         return 0;
+    }
+
+    /* Phase 5.4.1 — recursive cond eval over raw JSON. Empty expr
+     * (else branch) → true. Composite forms :
+     *   {"op":"and|or", "args":[<Cond>, …]}
+     *   {"op":"not",    "arg":<Cond>}
+     * Otherwise treated as a leaf : op is one of ==/!=/</>/<=/>=,
+     * with `var` and `value` fields. */
+    static int _pollen_cond_eval_expr(const char* env, size_t env_len,
+                                        const char* expr, size_t expr_len) {
+        if (expr_len == 0) return 1;
+        char outer_key[16];
+        if (!_pollen_expr_outer_key(expr, expr_len,
+                                      outer_key, sizeof(outer_key))) return 0;
+        if (strcmp(outer_key, "op") != 0) return 0;
+
+        const char* opv; size_t op_len;
+        if (!_pollen_json_field(expr, expr_len, "op", 2, &opv, &op_len)) return 0;
+        if (op_len < 2 || *opv != '"') return 0;
+        char op[16];
+        size_t olen = op_len - 2;
+        if (olen >= sizeof(op)) return 0;
+        memcpy(op, opv + 1, olen); op[olen] = 0;
+
+        if (strcmp(op, "and") == 0 || strcmp(op, "or") == 0) {
+            const char* args; size_t args_len;
+            if (!_pollen_json_field(expr, expr_len, "args", 4,
+                                      &args, &args_len)) return 0;
+            if (args_len < 2 || *args != '[') return 0;
+            int is_and = (op[0] == 'a');
+            const char* p = args + 1;
+            const char* end = args + args_len - 1;
+            while (p < end) {
+                while (p < end && (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n')) p++;
+                if (p >= end) break;
+                if (*p != '{') break;
+                const char* sp = p;
+                int depth = 1; int in_str = 0;
+                p++;
+                while (p < end && depth > 0) {
+                    if (in_str) {
+                        if (*p == '\\' && p + 1 < end) { p += 2; continue; }
+                        if (*p == '"') in_str = 0;
+                    } else {
+                        if (*p == '"') in_str = 1;
+                        else if (*p == '{') depth++;
+                        else if (*p == '}') depth--;
+                    }
+                    p++;
+                }
+                int sub_pass = _pollen_cond_eval_expr(env, env_len,
+                                                       sp, (size_t)(p - sp));
+                if (is_and && !sub_pass) return 0;
+                if (!is_and && sub_pass) return 1;
+            }
+            return is_and ? 1 : 0;
+        }
+
+        if (strcmp(op, "not") == 0) {
+            const char* arg; size_t arg_len;
+            if (!_pollen_json_field(expr, expr_len, "arg", 3,
+                                      &arg, &arg_len)) return 0;
+            return !_pollen_cond_eval_expr(env, env_len, arg, arg_len);
+        }
+
+        /* Leaf comparison. Decode op code, var, value. */
+        int op_code = POLLEN_COND_NONE;
+        if      (strcmp(op, "==") == 0) op_code = POLLEN_COND_EQ;
+        else if (strcmp(op, "!=") == 0) op_code = POLLEN_COND_NE;
+        else if (strcmp(op, "<")  == 0) op_code = POLLEN_COND_LT;
+        else if (strcmp(op, ">")  == 0) op_code = POLLEN_COND_GT;
+        else if (strcmp(op, "<=") == 0) op_code = POLLEN_COND_LE;
+        else if (strcmp(op, ">=") == 0) op_code = POLLEN_COND_GE;
+        else return 0;
+
+        const char* var; size_t var_len;
+        if (!_pollen_json_field(expr, expr_len, "var", 3,
+                                  &var, &var_len)) return 0;
+        if (var_len < 2 || *var != '"') return 0;
+        char path[POLLEN_COND_VAR_MAX];
+        size_t plen = var_len - 2;
+        if (plen >= sizeof(path)) plen = sizeof(path) - 1;
+        memcpy(path, var + 1, plen); path[plen] = 0;
+
+        const char* val; size_t val_len;
+        if (!_pollen_json_field(expr, expr_len, "value", 5,
+                                  &val, &val_len)) return 0;
+        int rhs_is_num = 0;
+        double rhs_num = 0;
+        char rhs_str[POLLEN_COND_STR_MAX] = "";
+        if (val_len > 0 && *val == '"') {
+            size_t slen = val_len >= 2 ? val_len - 2 : 0;
+            if (slen >= sizeof(rhs_str)) slen = sizeof(rhs_str) - 1;
+            memcpy(rhs_str, val + 1, slen); rhs_str[slen] = 0;
+        } else if (val_len > 0 && ((*val >= '0' && *val <= '9')
+                   || *val == '-' || *val == '+' || *val == '.')) {
+            char tmp[64];
+            size_t cn = val_len < sizeof(tmp) - 1 ? val_len : sizeof(tmp) - 1;
+            memcpy(tmp, val, cn); tmp[cn] = 0;
+            rhs_num = atof(tmp);
+            rhs_is_num = 1;
+        } else if (val_len == 4 && memcmp(val, "true", 4) == 0) {
+            strcpy(rhs_str, "true");
+        } else if (val_len == 5 && memcmp(val, "false", 5) == 0) {
+            strcpy(rhs_str, "false");
+        } else if (val_len == 4 && memcmp(val, "null", 4) == 0) {
+            strcpy(rhs_str, "null");
+        } else {
+            return 0;
+        }
+
+        return _pollen_cond_eval_leaf(env, env_len, path, op_code,
+                                        rhs_is_num, rhs_num, rhs_str);
+    }
+
+    /* Public wrapper kept for the cond forward path. */
+    static int _pollen_cond_eval(pollen_cond_branch_t* b,
+                                   const char* env, size_t env_len) {
+        return _pollen_cond_eval_expr(env, env_len,
+                                        b->cond_expr,
+                                        strlen(b->cond_expr));
     }
 
     /* Conditional forward : evaluate branches top-down, first true
@@ -1743,15 +1831,10 @@ import Amalgame.String
      * while loops on different roles don't collide. The cond can
      * reference state.X / data.X via the same path syntax as `if`.
      *
-     * Limitation : single-leaf cond (op + var + value). Phase 5.4.1
-     * will accept composite expressions. */
+     * Phase 5.4.1 — cond stored as raw JSON, same form as `if`
+     * branches : composite via and/or/not on top of leaf comparisons. */
     typedef struct {
-        /* Cond leaf */
-        char  var_path[POLLEN_COND_VAR_MAX];
-        int   op;
-        int   rhs_is_num;
-        double rhs_num;
-        char  rhs_str[POLLEN_COND_STR_MAX];
+        char  cond_expr[POLLEN_COND_EXPR_MAX];
         /* Auto-iter slot in the state file */
         char  iter_state_key[POLLEN_COND_VAR_MAX];
         int   max_iter;
@@ -1767,33 +1850,15 @@ import Amalgame.String
 
     static pollen_while_route_t _pollen_while_route;
 
-    static void _pollen_while_setup_s(const char* var_path,
-                                        const char* op_str,
-                                        int rhs_is_num, double rhs_num,
-                                        const char* rhs_str,
-                                        const char* iter_key,
-                                        int max_iter,
-                                        const char* self_host,
-                                        int self_port) {
+    static void _pollen_while_setup_expr(const char* cond_json,
+                                           const char* iter_key,
+                                           int max_iter,
+                                           const char* self_host,
+                                           int self_port) {
         _pollen_while_active = 1;
-        int op = POLLEN_COND_NONE;
-        if (op_str && op_str[0]) {
-            if      (!strcmp(op_str, "==")) op = POLLEN_COND_EQ;
-            else if (!strcmp(op_str, "!=")) op = POLLEN_COND_NE;
-            else if (!strcmp(op_str, "<"))  op = POLLEN_COND_LT;
-            else if (!strcmp(op_str, ">"))  op = POLLEN_COND_GT;
-            else if (!strcmp(op_str, "<=")) op = POLLEN_COND_LE;
-            else if (!strcmp(op_str, ">=")) op = POLLEN_COND_GE;
-        }
-        strncpy(_pollen_while_route.var_path, var_path ? var_path : "",
-                 POLLEN_COND_VAR_MAX - 1);
-        _pollen_while_route.var_path[POLLEN_COND_VAR_MAX - 1] = 0;
-        _pollen_while_route.op = op;
-        _pollen_while_route.rhs_is_num = rhs_is_num;
-        _pollen_while_route.rhs_num = rhs_num;
-        strncpy(_pollen_while_route.rhs_str, rhs_str ? rhs_str : "",
-                 POLLEN_COND_STR_MAX - 1);
-        _pollen_while_route.rhs_str[POLLEN_COND_STR_MAX - 1] = 0;
+        strncpy(_pollen_while_route.cond_expr, cond_json ? cond_json : "",
+                 POLLEN_COND_EXPR_MAX - 1);
+        _pollen_while_route.cond_expr[POLLEN_COND_EXPR_MAX - 1] = 0;
         strncpy(_pollen_while_route.iter_state_key,
                  iter_key ? iter_key : "_wf_iter",
                  POLLEN_COND_VAR_MAX - 1);
@@ -1841,18 +1906,9 @@ import Amalgame.String
         }
 
         int hit_max = (iter >= _pollen_while_route.max_iter);
-        /* Build a transient cond branch for eval reuse. */
-        pollen_cond_branch_t leaf;
-        strncpy(leaf.var_path, _pollen_while_route.var_path,
-                 POLLEN_COND_VAR_MAX - 1);
-        leaf.var_path[POLLEN_COND_VAR_MAX - 1] = 0;
-        leaf.op = _pollen_while_route.op;
-        leaf.rhs_is_num = _pollen_while_route.rhs_is_num;
-        leaf.rhs_num = _pollen_while_route.rhs_num;
-        strncpy(leaf.rhs_str, _pollen_while_route.rhs_str,
-                 POLLEN_COND_STR_MAX - 1);
-        leaf.rhs_str[POLLEN_COND_STR_MAX - 1] = 0;
-        int cond_pass = _pollen_cond_eval(&leaf, env, env_len);
+        int cond_pass = _pollen_cond_eval_expr(env, env_len,
+                                                 _pollen_while_route.cond_expr,
+                                                 strlen(_pollen_while_route.cond_expr));
 
         if (!hit_max && cond_pass) {
             /* Loop iteration : bump iter, forward to self. */
@@ -3043,41 +3099,21 @@ public class Program {
                 nxtSrcTag = "tree.while"
                 let condV: JsonValue   = nextAction.Get("cond")
                 let maxV:  JsonValue   = nextAction.Get("maxIter")
-                var op: string = ""
-                var varP: string = ""
-                var isNum: int  = 0
-                var numVal: float = 0.0
-                var strVal: string = ""
+                // Phase 5.4.1 — cond passed as raw JSON, evaluated
+                // recursively (composite and/or/not + leaves).
+                var condJson: string = ""
                 if (condV.IsObject()) {
-                    op   = condV.Get("op").AsString()
-                    varP = condV.Get("var").AsString()
-                    let valV: JsonValue = condV.Get("value")
-                    if (valV.IsNumber()) {
-                        isNum = 1
-                        if (valV.IsInt()) {
-                            let iv: int = valV.AsInt()
-                            numVal = iv * 1.0
-                        } else {
-                            numVal = valV.AsFloat()
-                        }
-                    } else if (valV.IsString()) {
-                        strVal = valV.AsString()
-                    } else if (valV.IsBool()) {
-                        if (valV.AsBool()) { strVal = "true" } else { strVal = "false" }
-                    }
+                    condJson = Json.Encode(condV)
                 }
                 var maxIter: int = 100
                 if (maxV.IsInt()) { maxIter = maxV.AsInt() }
-                // Self host:port = me's port + actualPort
                 let selfHost: string = me.Get("host").AsString()
                 let selfPort: int    = actualPort
                 let iterKey: string = "_wf_iter_" + role
-                @c { _pollen_while_setup_s(varP, op, (int) isNum, (double) numVal, strVal,
-                                            iterKey, (int) maxIter,
-                                            selfHost, (int) selfPort); }
-                // Exit targets = action after the while.
+                @c { _pollen_while_setup_expr(condJson, iterKey, (int) maxIter,
+                                                selfHost, (int) selfPort); }
                 let exitAction: JsonValue = Program.FindStepAfterDispatcher(treeV, role)
-                var inner: string = "while(" + varP + " " + op + ")→self+exits"
+                var inner: string = "while(cond)→self+exits"
                 if (exitAction.IsObject()) {
                     let exitTargets: List<string> = Program.ActionTargets(exitAction)
                     let ec: int = exitTargets.Count()
@@ -3103,33 +3139,31 @@ public class Program {
                     for bi in 0..bn {
                         let br: JsonValue = branches.Get(bi)
                         if (!br.IsObject()) { continue }
-                        let opV: JsonValue   = br.Get("op")
-                        let varV: JsonValue  = br.Get("var")
-                        let valV: JsonValue  = br.Get("value")
                         let thenV: JsonValue = br.Get("then")
-                        let op: string  = opV.AsString()
-                        let varP: string = varV.AsString()
-                        var isNum: int  = 0
-                        var numVal: float = 0.0
-                        var strVal: string = ""
-                        if (valV.IsNumber()) {
-                            isNum = 1
-                            // JSON 1000 lands as Int (AsFloat → 0.0
-                            // for non-float kinds). Pick the right
-                            // accessor or the rhs collapses to zero.
-                            if (valV.IsInt()) {
-                                let iv: int = valV.AsInt()
-                                numVal = iv * 1.0
-                            } else {
-                                numVal = valV.AsFloat()
+                        // Phase 5.4.1 — accept two forms :
+                        //   a) {"cond": <CondExpr>, "then": …}
+                        //      where CondExpr can be composite
+                        //      (and/or/not) or a leaf {"op":…,"var":…,"value":…}
+                        //   b) Legacy flat : {"op":…,"var":…,"value":…,"then":…}
+                        //      treated as a leaf cond.
+                        // Else branch : neither — empty cond.
+                        var condJson: string = ""
+                        let condV: JsonValue = br.Get("cond")
+                        if (condV.IsObject()) {
+                            condJson = Json.Encode(condV)
+                        } else {
+                            let opV: JsonValue = br.Get("op")
+                            let opS: string = opV.AsString()
+                            if (String_Length(opS) > 0) {
+                                // Re-encode legacy leaf form as a
+                                // canonical Cond JSON so the C eval
+                                // only has one shape to deal with.
+                                let varEnc: string = Json.Encode(br.Get("var"))
+                                let valEnc: string = Json.Encode(br.Get("value"))
+                                condJson = "{\"op\":\"" + opS + "\",\"var\":" + varEnc + ",\"value\":" + valEnc + "}"
                             }
-                        } else if (valV.IsString()) {
-                            strVal = valV.AsString()
-                        } else if (valV.IsBool()) {
-                            if (valV.AsBool()) { strVal = "true" } else { strVal = "false" }
                         }
-                        @c { _pollen_cond_branch_open_s(varP, op, (int) isNum,
-                                                         (double) numVal, strVal); }
+                        @c { _pollen_cond_branch_open_expr(condJson); }
                         // Resolve `then` targets to (host, port) and
                         // register against this branch slot.
                         let thenTargets: List<string> = Program.ActionTargets(thenV)
